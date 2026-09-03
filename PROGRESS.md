@@ -69,10 +69,24 @@ BTreeMap grouping with a sort of row indices.
 - src/query/vectorized/tests.rs: 10 queries run through both engines, rows compared exactly
   (order included), plus a test that not/or is not claimed.
 
-## Next
-1. cargo test -p triplox, clippy.
-2. A/B interleaved bench.
-3. EXPERIMENT.md, fmt, commit.
+### Results
+- `cargo test -p triplox` passes (610 lib + 32 integration) both with and without
+  `TRIPLOX_BATCHED_JOIN=1`. `cargo clippy -p triplox --all-targets` is clean.
+- A/B interleaved (3 passes per arm, 5 runs each): triangles -33.6%/-41.5% (min/median),
+  two_hop_count -30.2%/-39.1%, three_hop_count -70.4%/-72.2%, heavy_neighbors -10.7% min,
+  weight_filter -10.6% min, weight_sum -18.2% min. Single-level queries (out_degree,
+  in_degree_top, neighbors_of_42, label_lookup) are inside the noise. Row counts identical in
+  both arms and equal to the hand-off baseline for all ten queries.
+- Full write-up, hook points and honest gaps: EXPERIMENT.md.
+
+## Next (if this is picked up again)
+1. Columnar aggregate/projection sink, so `execute` stops ending in `Batch::to_binding_bag`.
+   Biggest remaining win, especially for the counting queries.
+2. `BatchPattern` for `relation` and `function` patterns.
+3. Pipelined chunking with a row budget (what issue #204 actually asked for), restricted to
+   prefixes of single-proposer stages — chunking is not order-preserving across a multi-proposer
+   stage.
+4. `not`/`or`, then delete the row path in triple.rs so the six `validate` arms exist once.
 
 ### Environment note
 The machine ran out of disk during this session (0 bytes free for a while; ~1.5 GiB free after).
