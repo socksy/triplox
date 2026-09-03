@@ -27,6 +27,9 @@ mod query_validation;
 pub mod schema;
 #[cfg(not(any(test, feature = "test-helpers")))]
 mod schema;
+mod segment;
+#[cfg(test)]
+mod segment_layout_test;
 mod slate;
 mod tempids;
 pub mod tx;
@@ -39,4 +42,5 @@ pub mod node;
 pub mod server;
 
 pub use node::{Database, IntoQuery, Node, QueryNode, SubmitNode, TransactionResult, TxKey, DB};
+pub use segment::SegmentLayout;
 pub use triplox_client::{client, msgpack_codec, protocol, subscription, transaction};

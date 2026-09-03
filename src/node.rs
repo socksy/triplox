@@ -22,6 +22,7 @@ use crate::log::{subscribe, TxLog, TxLogReader, TxLogWriter};
 use crate::memory_log::MemoryLog;
 use crate::ops::{QueryArg, TxOp};
 use crate::schema::Schema;
+use crate::segment::SegmentLayout;
 use crate::slate::{in_memory_slate, local_slate, remote_slate, SlateComponents};
 use edn::query::ParsedQuery;
 use tokio_util::sync::CancellationToken;
@@ -40,6 +41,7 @@ pub struct Node<L: TxLog> {
     pub(crate) slate: SlateComponents,
     subscription: CancellationToken,
     incremental: IncrementalQueryService,
+    layout: SegmentLayout,
 }
 
 pub(crate) trait SchemaProvider: Send + Sync + 'static {
@@ -107,21 +109,31 @@ impl<L: TxLog> Node<L> {
             slate,
             subscription,
             incremental,
+            layout: SegmentLayout::from_env(),
         })
     }
 }
 
 impl Node<MemoryLog> {
     pub async fn memory_node() -> Self {
+        Self::memory_node_with_layout(SegmentLayout::from_env()).await
+    }
+
+    pub async fn memory_node_with_layout(layout: SegmentLayout) -> Self {
         let slate = in_memory_slate().await;
-        let metadata = crate::bootstrap::init_db(&slate).await.unwrap();
+        let metadata = crate::bootstrap::init_db_with_layout(&slate, layout)
+            .await
+            .unwrap();
         let bootstrap_tx_key = *crate::bootstrap::BOOTSTRAP_TX_KEY;
-        let indexer = Arc::new(tokio::sync::RwLock::new(Indexer::new(
-            slate.db.clone(),
-            metadata,
-            bootstrap_tx_key,
-            DEFAULT_TX_COMPLETION_CAPACITY,
-        )));
+        let indexer = Arc::new(tokio::sync::RwLock::new(
+            Indexer::new(
+                slate.db.clone(),
+                metadata,
+                bootstrap_tx_key,
+                DEFAULT_TX_COMPLETION_CAPACITY,
+            )
+            .with_layout(layout),
+        ));
         let log = Arc::new(MemoryLog::new(Box::new(clock::SystemClock)));
         log.ensure_bootstrap_record().await.unwrap();
 
@@ -144,6 +156,7 @@ impl Node<MemoryLog> {
             slate,
             subscription,
             incremental,
+            layout,
         }
     }
 }
@@ -261,7 +274,8 @@ impl<L: TxLog> Node<L> {
             handle,
             tx_key,
             range_stats,
-        ))
+        )
+        .with_layout(self.layout))
     }
 
     pub(crate) async fn register_incremental_query(
@@ -331,7 +345,11 @@ impl<L: TxLog> QueryNode for Node<L> {
             .clone();
         let handle = Handle::current();
         let range_stats = self.slate.range_stats.clone();
-        DB::from_latest_sdb(self.slate.db.clone(), ident_map, handle, range_stats).await
+        Ok(
+            DB::from_latest_sdb(self.slate.db.clone(), ident_map, handle, range_stats)
+                .await?
+                .with_layout(self.layout),
+        )
     }
 
     async fn db_as_of(&self, tx_key: TxKey) -> Result<DB, Error> {

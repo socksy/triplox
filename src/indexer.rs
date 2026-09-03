@@ -20,6 +20,7 @@ use crate::ops::DataType;
 use crate::ops::{Datom, DatomOp, Entid, TxOp};
 use crate::partition::{extract_counter, partition_entity_prefix, tx_eid_from_tx_id, TX_PARTITION};
 use crate::schema::{Schema, DB_TX_ABORTED, DB_TX_COMMITTED};
+use crate::segment::{merge_into_segments, SegmentLayout};
 use crate::slate::{DEFAULT_SCAN_OPTIONS, DEFAULT_WRITE_OPTIONS};
 use crate::tempids;
 use crate::transaction::TxKey;
@@ -47,14 +48,51 @@ pub struct Indexer {
     metadata: Metadata,
     latest_indexed_tx: TxKey,
     tx_completion_sender: broadcast::Sender<TxCompletion>,
+    layout: SegmentLayout,
 }
 
-/// Write index entries for datoms into a SlateDB WriteBatch.
+/// Write index entries for datoms into a SlateDB WriteBatch (row layout).
 pub(crate) fn write_index_entries(
     batch: &mut WriteBatch,
     datoms: &[Datom],
     schema: &Schema,
     tx_eid: i64,
+) -> Result<(), Error> {
+    write_index_entries_inner(batch, datoms, schema, tx_eid, None)
+}
+
+/// Write index entries in the given layout. Columnar merges AEV/AVE keys into
+/// segments (which needs reads) and skips AE/AV, which are served from segment columns.
+pub(crate) async fn write_index_entries_with_layout<D>(
+    db: &D,
+    batch: &mut WriteBatch,
+    datoms: &[Datom],
+    schema: &Schema,
+    tx_eid: i64,
+    layout: SegmentLayout,
+) -> Result<(), Error>
+where
+    D: DbReadOps + Sync,
+{
+    match layout {
+        SegmentLayout::Row => write_index_entries(batch, datoms, schema, tx_eid),
+        SegmentLayout::Columnar { segment_size } => {
+            let mut segmented = (Vec::new(), Vec::new());
+            write_index_entries_inner(batch, datoms, schema, tx_eid, Some(&mut segmented))?;
+            let (aev, ave) = segmented;
+            merge_into_segments(db, batch, codec::AEV, aev, segment_size).await?;
+            merge_into_segments(db, batch, codec::AVE, ave, segment_size).await
+        }
+    }
+}
+
+/// `segmented`, when given, collects the (AEV, AVE) row keys instead of putting them.
+fn write_index_entries_inner(
+    batch: &mut WriteBatch,
+    datoms: &[Datom],
+    schema: &Schema,
+    tx_eid: i64,
+    mut segmented: Option<&mut (Vec<Bytes>, Vec<Bytes>)>,
 ) -> Result<(), Error> {
     let tx_eid_bytes = encode_i64_bytes(tx_eid);
     let mut key_buf: Vec<u8> = Vec::with_capacity(64);
@@ -100,7 +138,10 @@ pub(crate) fn write_index_entries(
         key_buf.extend_from_slice(entity_bytes);
         key_buf.extend_from_slice(&tx_eid_bytes);
         key_buf.push(op_byte);
-        batch.put(&key_buf, b"");
+        match segmented.as_deref_mut() {
+            Some((_, ave)) => ave.push(Bytes::copy_from_slice(&key_buf)),
+            None => batch.put(&key_buf, b""),
+        }
 
         // AEV
         key_buf.clear();
@@ -110,7 +151,10 @@ pub(crate) fn write_index_entries(
         key_buf.extend_from_slice(value);
         key_buf.extend_from_slice(&tx_eid_bytes);
         key_buf.push(op_byte);
-        batch.put(&key_buf, b"");
+        match segmented.as_deref_mut() {
+            Some((aev, _)) => aev.push(Bytes::copy_from_slice(&key_buf)),
+            None => batch.put(&key_buf, b""),
+        }
 
         // VAE is a unique-only index used for uniqueness checks, lookup refs,
         // and :db.unique/identity upsert resolution.
@@ -127,7 +171,7 @@ pub(crate) fn write_index_entries(
 
         // AE and AV are atemporal, purely additive indices.
         // Retractions are not written to AE/AV.
-        if datom.op == DatomOp::Assert {
+        if datom.op == DatomOp::Assert && segmented.is_none() {
             key_buf.clear();
             key_buf.push(codec::AE);
             key_buf.extend_from_slice(&attr_bytes);
@@ -252,7 +296,13 @@ impl Indexer {
             metadata,
             latest_indexed_tx,
             tx_completion_sender,
+            layout: SegmentLayout::from_env(),
         }
+    }
+
+    pub fn with_layout(mut self, layout: SegmentLayout) -> Self {
+        self.layout = layout;
+        self
     }
 
     pub fn metadata(&self) -> &Metadata {
@@ -352,7 +402,15 @@ impl Indexer {
 
         // 9. Write indices + commit
         let mut batch = WriteBatch::new();
-        write_index_entries(&mut batch, &datoms, &self.metadata.schema, tx_eid)?;
+        write_index_entries_with_layout(
+            self.slatedb.as_ref(),
+            &mut batch,
+            &datoms,
+            &self.metadata.schema,
+            tx_eid,
+            self.layout,
+        )
+        .await?;
         self.slatedb
             .write_with_options(batch, &DEFAULT_WRITE_OPTIONS)
             .await?;
@@ -551,6 +609,7 @@ impl Indexer {
             baseline: self.latest_indexed_tx,
             rx: self.tx_completion_sender.subscribe(),
             slatedb: self.slatedb.clone(),
+            layout: self.layout,
         }
     }
 
@@ -561,7 +620,15 @@ impl Indexer {
         pending_pm.set_tx_counter(tx_key.tx_id)?;
         let datoms = build_tx_entity_datoms(tx_eid, tx_key, false, Some(error));
         let mut batch = WriteBatch::new();
-        write_index_entries(&mut batch, &datoms, &self.metadata.schema, tx_eid)?;
+        write_index_entries_with_layout(
+            self.slatedb.as_ref(),
+            &mut batch,
+            &datoms,
+            &self.metadata.schema,
+            tx_eid,
+            self.layout,
+        )
+        .await?;
         self.slatedb
             .write_with_options(batch, &DEFAULT_WRITE_OPTIONS)
             .await?;
@@ -581,6 +648,7 @@ pub(crate) struct TxWaiter {
     baseline: TxKey,
     rx: broadcast::Receiver<TxCompletion>,
     slatedb: Arc<Db>,
+    layout: SegmentLayout,
 }
 
 impl TxWaiter {
@@ -651,7 +719,7 @@ impl TxWaiter {
     /// Recover an already-indexed transaction's outcome from storage.
     /// A missing tx entity means a technical failure.
     async fn completion_from_storage(&self, tx_key: TxKey) -> Result<TxCompletion, Error> {
-        match tx::lookup_tx_completion(self.slatedb.as_ref(), tx_key).await? {
+        match tx::lookup_tx_completion(self.slatedb.as_ref(), tx_key, self.layout).await? {
             Some(completion) => Ok(completion),
             // TODO: Deal with proper error escalation here. See #118.
             None => {
@@ -1217,9 +1285,10 @@ mod tests {
             )
             .await?;
 
-        let completion = tx::lookup_tx_completion(components.db.as_ref(), tx_key)
-            .await?
-            .expect("tx entity should exist");
+        let completion =
+            tx::lookup_tx_completion(components.db.as_ref(), tx_key, SegmentLayout::Row)
+                .await?
+                .expect("tx entity should exist");
         assert_eq!(completion.tx_key, basis);
         assert!(matches!(completion.outcome, TxOutcome::Committed));
 
@@ -1245,9 +1314,10 @@ mod tests {
             )
             .await?;
 
-        let completion = tx::lookup_tx_completion(components.db.as_ref(), tx_key)
-            .await?
-            .expect("aborted tx entity should exist");
+        let completion =
+            tx::lookup_tx_completion(components.db.as_ref(), tx_key, SegmentLayout::Row)
+                .await?
+                .expect("aborted tx entity should exist");
         assert_eq!(completion.tx_key, basis);
         assert!(matches!(completion.outcome, TxOutcome::Aborted(_)));
         assert_outcome_err(&completion.outcome, "Unknown attribute");
@@ -1263,9 +1333,11 @@ mod tests {
             tx_id: 42,
             system_time: st_from_unix_epoch(2),
         };
-        assert!(tx::lookup_tx_completion(components.db.as_ref(), tx_key)
-            .await?
-            .is_none());
+        assert!(
+            tx::lookup_tx_completion(components.db.as_ref(), tx_key, SegmentLayout::Row)
+                .await?
+                .is_none()
+        );
 
         Ok(())
     }

@@ -15,6 +15,7 @@ use crate::metadata::PartitionMap;
 use crate::ops::{DataType, Datom, DatomOp, Entid, EntityRef, TxOp};
 use crate::partition::{extract_partition, DB_PARTITION, TX_PARTITION};
 use crate::schema::{Schema, Unique, ValueType, DB_TX_ABORTED, DB_TX_COMMITTED};
+use crate::segment::SegmentLayout;
 use crate::slate::DEFAULT_SCAN_OPTIONS;
 use crate::transaction::TxKey;
 use crate::util::{concat_bytes, next_prefix};
@@ -616,6 +617,7 @@ pub(crate) fn validate_allocated_entity_ids(
 pub(crate) async fn lookup_tx_completion<D>(
     sdb: &D,
     tx_key: TxKey,
+    layout: SegmentLayout,
 ) -> Result<Option<TxCompletion>, Error>
 where
     D: DbReadOps + Sync,
@@ -628,12 +630,21 @@ where
         &encode_i64_bytes(crate::schema::DB_TX_ID),
         &value_buf,
     ]);
-    let mut iter = sdb
-        .scan_prefix_with_options(&ave_prefix, .., &DEFAULT_SCAN_OPTIONS)
-        .await?;
+    let ave_keys = if layout.is_columnar() {
+        crate::segment::row_keys_with_prefix(sdb, &ave_prefix).await?
+    } else {
+        let mut iter = sdb
+            .scan_prefix_with_options(&ave_prefix, .., &DEFAULT_SCAN_OPTIONS)
+            .await?;
+        let mut keys = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            keys.push(kv.key);
+        }
+        keys
+    };
     let mut tx_eid: Option<i64> = None;
-    while let Some(kv) = iter.next().await? {
-        let (_attribute, _value, entity, _tx_eid, op) = ave_key_to_parts(kv.key)?;
+    for key in ave_keys {
+        let (_attribute, _value, entity, _tx_eid, op) = ave_key_to_parts(key)?;
         if op == codec::RETRACT {
             continue;
         }

@@ -1,0 +1,60 @@
+# Experiment: columnar (SoA) segment encoding for AEV/AVE
+
+## Goal
+Pack runs of sorted datoms for one attribute into one SlateDB key (keyed by the last datom key so forward seek lands on the right segment) with column-wise encoding: first/second component, op bitmap, tx column; FOR + bit-packing for integer columns, offsets+bytes otherwise. Column-only reads for AE/AV-style scans. Toggle: layout switch (see src/segment.rs and how bootstrap/node pass a layout). Ingest may be slow but must be correct. Temporal filtering must work via the tx column.
+
+## Status
+
+- Compiles clean. Toggle plumbed end to end via `SegmentLayout::from_env()` (`TRIPLOX_SEGMENT_LAYOUT=columnar`, `TRIPLOX_SEGMENT_SIZE`): bootstrap.rs, indexer.rs, node.rs, db_value.rs all read it; the query engine picks `SegmentIterator` in src/query/patterns/triple.rs:148. Only `tx::lookup_tx_completion` reads AEV/AVE outside the query engine and it is layout-aware.
+- src/segment_layout_test.rs: row-vs-columnar equivalence over 9 queries (current DB and as-of a pre-retraction tx) plus a per-index key/byte/datom-count storage report. **PASSES.**
+- Fixed a real bug: `Segment::decode_first_column` left the second column with one offset, so any AE/AV `lower_bound`/`cmp_key` panicked (index out of bounds). Now n+1 zero offsets so second reads as empty.
+- Equivalence-test storage report (30 vertices, ~87 edges, segment_size 64):
+  row: 1165 keys, 36289 bytes total. columnar: 335 keys, 16421 bytes total (-55%). AEV datoms 247 == 247.
+
+### Disk hazard (read this)
+The machine disk hit 100% repeatedly; five agents build concurrently. Two things matter:
+- Build with debug info off, which cuts this worktree's target from ~3.2G to ~1.6G:
+  `export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=off CARGO_PROFILE_BENCH_DEBUG=0`
+- When bash tool calls fail with ENOSPC the command does not run at all. Check `df -h /System/Volumes/Data` first.
+`target/debug` and `target/release` were deleted once each to make room (no `cargo clean`).
+
+### Test / clippy status
+- `cargo test -p triplox` (default = row layout): **all green** — 613 lib + 23 client_server + 3 fixture_compat + 6 subscription.
+- `cargo clippy -p triplox --all-targets`: **clean, no warnings.**
+- `TRIPLOX_SEGMENT_LAYOUT=columnar cargo test -p triplox --lib`: 603 pass, 10 fail. All 10 are test-harness artifacts, not query-result bugs:
+  - 6 `query::patterns::triple::tests::*` write raw row keys straight into SlateDB and then read through the query engine; in columnar mode the reader finds a row key where a segment should be ("bad segment header").
+  - `count_applies_bound_term_estimate_to_each_duplicate_row` asserts an exact key-count estimate; columnar deliberately scales the estimate by segment_size (6144 vs 6).
+  - `indexer::tests::test_retract_on_overwrite` asserts a raw AE key exists; columnar intentionally does not write AE/AV (they are served from AEV/AVE first columns).
+  - 2 `indexer::tests::test_lookup_tx_completion_*` pass `SegmentLayout::Row` explicitly while the indexer under test picks the layout from the env.
+
+### Bench + storage (done)
+- A/B interleaved (3 processes/side, 5 runs/query), 2000 vertices, edge_prob 0.01. JSON at
+  scratchpad results dir: columnar-storage-off.json / columnar-storage-on.json.
+- Wins everywhere except three_hop_count (1.25x slower, and noisy). neighbors_of_42 0.06x,
+  out_degree 0.32x, in_degree_top 0.34x, weight_filter 0.40x, heavy_neighbors 0.52x,
+  triangles 0.79x, two_hop 0.81x. Row counts match baseline on every query.
+- `storage_report_at_scale` (#[ignore], VERTICES/FANOUT env): row 5,338,697 bytes / 154,913 keys
+  vs columnar 2,073,186 bytes / 48,427 keys (-61% bytes, -69% keys).
+
+## Next
+Experiment is complete: EXPERIMENT.md written, fmt clean, all commits on this branch, nothing pushed.
+Optional follow-ups (all discussed in EXPERIMENT.md): persist the layout in bootstrap metadata
+instead of an env var; per-segment first-column index to kill the three_hop regression;
+parameterise the 10 layout-sensitive unit tests.
+
+## Shared context
+
+Toolchain: every shell needs `export PATH="$HOME/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin:$PATH"` and `export CARGO_BUILD_JOBS=3`. Never run `cargo clean`. Work only in this worktree.
+
+Benchmark: `cargo bench --bench datalog_bench` (env VERTICES, EDGE_PROB, RUNS, BENCH_OUT). Baseline JSON: /private/tmp/claude-501/-Users-ben-code-triplox/2cc95019-6318-4527-8430-7ad4b12972b9/scratchpad/results/baseline.json. Baseline medians (ms): triangles 537 (7821 rows), two_hop_count 223, three_hop_count 7041, out_degree 44 (2000 rows), in_degree_top 44 (2000 rows), neighbors_of_42 1.1 (21 rows), weight_filter 3.7 (198 rows), weight_sum 3.6, heavy_neighbors 68 (1908 rows), label_lookup 0.02 (1 row).
+
+Definition of done:
+1. Feature behind an env toggle; results identical on/off (row counts match baseline; an on/off equivalence test on a small graph).
+2. `cargo test -p triplox` and `cargo clippy -p triplox --all-targets` pass, or failures are listed here honestly.
+3. A/B interleaved bench, 3 runs each; JSON written to /private/tmp/claude-501/-Users-ben-code-triplox/2cc95019-6318-4527-8430-7ad4b12972b9/scratchpad/results/columnar-storage-off.json and /private/tmp/claude-501/-Users-ben-code-triplox/2cc95019-6318-4527-8430-7ad4b12972b9/scratchpad/results/columnar-storage-on.json.
+4. EXPERIMENT.md at worktree root: what was built, hook points (file:line), A/B table, what failed, honest verdict and integration cost.
+5. `cargo fmt`; commit on this branch; do not push; no GitHub issues/PRs.
+
+## Progress protocol
+
+After every milestone (compiles, test passes, bench run, doc written): update the Status and Next sections below, then `git add -A && git commit -q -m "wip(columnar-storage): <milestone>"`. Commit even if incomplete. This file is the hand-off; a fresh agent must be able to continue from it alone.
