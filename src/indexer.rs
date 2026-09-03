@@ -58,7 +58,7 @@ pub(crate) fn write_index_entries(
     schema: &Schema,
     tx_eid: i64,
 ) -> Result<(), Error> {
-    write_index_entries_inner(batch, datoms, schema, tx_eid, None)
+    write_index_entries_inner(batch, datoms, schema, tx_eid, KeySink::Batch)
 }
 
 /// Write index entries in the given layout. Columnar merges AEV/AVE keys into
@@ -76,9 +76,20 @@ where
 {
     match layout {
         SegmentLayout::Row => write_index_entries(batch, datoms, schema, tx_eid),
+        SegmentLayout::RowSegments { segment_size } => {
+            let mut keys = Vec::new();
+            write_index_entries_inner(batch, datoms, schema, tx_eid, KeySink::All(&mut keys))?;
+            crate::row_segment::write_segmented(db, batch, keys, segment_size).await
+        }
         SegmentLayout::Columnar { segment_size } => {
             let mut segmented = (Vec::new(), Vec::new());
-            write_index_entries_inner(batch, datoms, schema, tx_eid, Some(&mut segmented))?;
+            write_index_entries_inner(
+                batch,
+                datoms,
+                schema,
+                tx_eid,
+                KeySink::Columnar(&mut segmented),
+            )?;
             let (aev, ave) = segmented;
             merge_into_segments(db, batch, codec::AEV, aev, segment_size).await?;
             merge_into_segments(db, batch, codec::AVE, ave, segment_size).await
@@ -86,13 +97,33 @@ where
     }
 }
 
-/// `segmented`, when given, collects the (AEV, AVE) row keys instead of putting them.
+/// Where a freshly built index key goes.
+enum KeySink<'a> {
+    /// Straight into the write batch as its own entry.
+    Batch,
+    /// AEV and AVE keys are collected for columnar segment building; AE/AV are dropped
+    /// because the columnar layout serves them from a segment's first column.
+    Columnar(&'a mut (Vec<Bytes>, Vec<Bytes>)),
+    /// Every key is collected so row-major segments can be built across all indexes.
+    All(&'a mut Vec<Vec<u8>>),
+}
+
+impl KeySink<'_> {
+    fn put(&mut self, batch: &mut WriteBatch, key: &[u8]) {
+        match self {
+            KeySink::Batch | KeySink::Columnar(_) => batch.put(key, b""),
+            KeySink::All(keys) => keys.push(key.to_vec()),
+        }
+    }
+}
+
+/// Build the index keys (EAV, AVE, AEV, VAE, AE, AV) for `datoms` and hand each to `sink`.
 fn write_index_entries_inner(
     batch: &mut WriteBatch,
     datoms: &[Datom],
     schema: &Schema,
     tx_eid: i64,
-    mut segmented: Option<&mut (Vec<Bytes>, Vec<Bytes>)>,
+    mut sink: KeySink<'_>,
 ) -> Result<(), Error> {
     let tx_eid_bytes = encode_i64_bytes(tx_eid);
     let mut key_buf: Vec<u8> = Vec::with_capacity(64);
@@ -128,7 +159,7 @@ fn write_index_entries_inner(
         key_buf.extend_from_slice(value);
         key_buf.extend_from_slice(&tx_eid_bytes);
         key_buf.push(op_byte);
-        batch.put(&key_buf, b"");
+        sink.put(batch, &key_buf);
 
         // AVE
         key_buf.clear();
@@ -138,9 +169,9 @@ fn write_index_entries_inner(
         key_buf.extend_from_slice(entity_bytes);
         key_buf.extend_from_slice(&tx_eid_bytes);
         key_buf.push(op_byte);
-        match segmented.as_deref_mut() {
-            Some((_, ave)) => ave.push(Bytes::copy_from_slice(&key_buf)),
-            None => batch.put(&key_buf, b""),
+        match &mut sink {
+            KeySink::Columnar((_, ave)) => ave.push(Bytes::copy_from_slice(&key_buf)),
+            sink => sink.put(batch, &key_buf),
         }
 
         // AEV
@@ -151,9 +182,9 @@ fn write_index_entries_inner(
         key_buf.extend_from_slice(value);
         key_buf.extend_from_slice(&tx_eid_bytes);
         key_buf.push(op_byte);
-        match segmented.as_deref_mut() {
-            Some((aev, _)) => aev.push(Bytes::copy_from_slice(&key_buf)),
-            None => batch.put(&key_buf, b""),
+        match &mut sink {
+            KeySink::Columnar((aev, _)) => aev.push(Bytes::copy_from_slice(&key_buf)),
+            sink => sink.put(batch, &key_buf),
         }
 
         // VAE is a unique-only index used for uniqueness checks, lookup refs,
@@ -166,23 +197,23 @@ fn write_index_entries_inner(
             key_buf.extend_from_slice(entity_bytes);
             key_buf.extend_from_slice(&tx_eid_bytes);
             key_buf.push(op_byte);
-            batch.put(&key_buf, b"");
+            sink.put(batch, &key_buf);
         }
 
         // AE and AV are atemporal, purely additive indices.
         // Retractions are not written to AE/AV.
-        if datom.op == DatomOp::Assert && segmented.is_none() {
+        if datom.op == DatomOp::Assert && !matches!(sink, KeySink::Columnar(_)) {
             key_buf.clear();
             key_buf.push(codec::AE);
             key_buf.extend_from_slice(&attr_bytes);
             key_buf.extend_from_slice(entity_bytes);
-            batch.put(&key_buf, b"");
+            sink.put(batch, &key_buf);
 
             key_buf.clear();
             key_buf.push(codec::AV);
             key_buf.extend_from_slice(&attr_bytes);
             key_buf.extend_from_slice(value);
-            batch.put(&key_buf, b"");
+            sink.put(batch, &key_buf);
         }
     }
 
@@ -202,13 +233,11 @@ where
     D: DbReadOps + Sync,
 {
     let eav_tx_prefix = concat_bytes(&[&[codec::EAV], &partition_entity_prefix(TX_PARTITION)]);
-    let mut iter = sdb
-        .scan_prefix_with_options(&eav_tx_prefix, .., &DEFAULT_SCAN_OPTIONS)
-        .await?;
+    let mut iter = crate::row_segment::KeyCursor::scan_prefix(sdb, &eav_tx_prefix).await?;
     let mut first_eid: Option<i64> = None;
     let mut system_time: Option<crate::clock::Instant> = None;
-    while let Some(kv) = iter.next().await? {
-        let (entity_dt, attribute, value, _tx_eid, _op) = eav_key_to_parts(kv.key)?;
+    while let Some(key) = iter.next().await? {
+        let (entity_dt, attribute, value, _tx_eid, _op) = eav_key_to_parts(key)?;
         let eid = match entity_dt {
             DataType::Long(id) => id,
             other => bail!("Expected Long entity ID in EAV key, got {:?}", other),

@@ -193,44 +193,59 @@ pub fn datoms_from_cdc_transaction(
         if entry.key.first() != Some(&codec::EAV) {
             continue;
         }
-        if matches!(entry.value, ValueDeletable::Tombstone) {
+        let ValueDeletable::Value(value) = &entry.value else {
             continue;
+        };
+
+        // One entry can carry several datom keys, some written by earlier transactions
+        // and only rewritten here (see `crate::row_segment`), so each datom's own tx eid
+        // decides whether it belongs to this transaction.
+        for datom_key in crate::row_segment::decode_segment(&entry.key, value)? {
+            let (entity_dt, attribute_id, value, tx_eid, op_byte) = eav_key_to_parts(datom_key)?;
+
+            let entity = match entity_dt {
+                DataType::Long(id) => id,
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "Expected Long entity in EAV key, got {:?}",
+                        other
+                    ))
+                }
+            };
+
+            let attribute = schema
+                .get_ident(attribute_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Unknown attribute entity_id {} in EAV key", attribute_id)
+                })?
+                .clone();
+
+            let op = match op_byte {
+                codec::ADD => DatomOp::Assert,
+                codec::RETRACT => DatomOp::Retract,
+                other => return Err(anyhow::anyhow!("Unknown op byte: {}", other)),
+            };
+
+            datoms.push((
+                tx_eid,
+                Datom {
+                    entity,
+                    attribute,
+                    value,
+                    op,
+                },
+            ));
         }
-
-        let (entity_dt, attribute_id, value, _tx_eid, op_byte) =
-            eav_key_to_parts(entry.key.clone())?;
-
-        let entity = match entity_dt {
-            DataType::Long(id) => id,
-            other => {
-                return Err(anyhow::anyhow!(
-                    "Expected Long entity in EAV key, got {:?}",
-                    other
-                ))
-            }
-        };
-
-        let attribute = schema
-            .get_ident(attribute_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!("Unknown attribute entity_id {} in EAV key", attribute_id)
-            })?
-            .clone();
-
-        let op = match op_byte {
-            codec::ADD => DatomOp::Assert,
-            codec::RETRACT => DatomOp::Retract,
-            other => return Err(anyhow::anyhow!("Unknown op byte: {}", other)),
-        };
-
-        datoms.push(Datom {
-            entity,
-            attribute,
-            value,
-            op,
-        });
     }
-    Ok(datoms)
+    // Transaction eids increase, so the newest one in the batch is this transaction's.
+    let Some(this_tx) = datoms.iter().map(|(tx_eid, _)| *tx_eid).max() else {
+        return Ok(Vec::new());
+    };
+    Ok(datoms
+        .into_iter()
+        .filter(|(tx_eid, _)| *tx_eid == this_tx)
+        .map(|(_, datom)| datom)
+        .collect())
 }
 
 #[cfg(test)]

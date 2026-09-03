@@ -6,7 +6,7 @@ use anyhow::Error;
 use slatedb::{DbMetadataOps, DbReadOps};
 use tokio::runtime::Handle;
 
-use crate::slate::DEFAULT_SCAN_OPTIONS;
+use crate::row_segment::KeyCursor;
 
 pub(crate) trait Index {
     fn count(&self) -> Result<u64, Error>;
@@ -23,7 +23,7 @@ pub(crate) struct SlateIterator<M>
 where
     M: DbMetadataOps + Send + Sync,
 {
-    inner: slatedb::DbIterator,
+    inner: KeyCursor,
     current_key: Option<Bytes>,
     prefix: Bytes,
     handle: Handle,
@@ -46,12 +46,8 @@ where
         D: DbReadOps + Send + Sync,
     {
         let prefix_bytes = Bytes::from(prefix.to_vec());
-        let mut iterator =
-            handle.block_on(slate.scan_prefix_with_options(prefix, .., &DEFAULT_SCAN_OPTIONS))?;
-        let mut current_key = None;
-        if let Some(next_key) = handle.block_on(iterator.next())? {
-            current_key = Some(next_key.key.clone());
-        }
+        let mut iterator = handle.block_on(KeyCursor::scan_prefix(slate, prefix))?;
+        let current_key = handle.block_on(iterator.next())?;
         Ok(Self {
             inner: iterator,
             current_key,
@@ -77,28 +73,26 @@ where
     fn seek(&mut self, extension: Bytes) -> Result<(), Error> {
         let mut full_key = self.prefix.to_vec();
         full_key.extend_from_slice(&extension);
-        let full_key = Bytes::from(full_key);
 
         // SlateDB forbids backward seeks. If already at or past the target, skip the seek.
         // TODO: check if this extra check can be avoided. Normally we should only seek forwards.
         match &self.current_key {
-            Some(current) if current.as_ref() >= full_key.as_ref() => return Ok(()),
+            Some(current) if current.as_ref() >= full_key.as_slice() => return Ok(()),
             _ => {}
         }
 
-        self.handle.block_on(self.inner.seek(full_key))?;
+        self.handle.block_on(self.inner.seek(&full_key))?;
 
         // Update current_key so get_value() reflects the new position.
-        let next_entry = self.handle.block_on(self.inner.next())?;
-        self.current_key = next_entry.map(|e| e.key.clone());
+        self.current_key = self.handle.block_on(self.inner.next())?;
         Ok(())
     }
 
     fn next(&mut self) -> Result<Option<Bytes>, Error> {
         let next_key = self.handle.block_on(self.inner.next())?;
         if let Some(next_key) = next_key {
-            self.current_key = Some(next_key.key.clone());
-            Ok(Some((self.extractor)(next_key.key)))
+            self.current_key = Some(next_key.clone());
+            Ok(Some((self.extractor)(next_key)))
         } else {
             self.current_key = None;
             Ok(None)

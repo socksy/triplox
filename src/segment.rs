@@ -48,29 +48,37 @@ const COLUMN_RAW: u8 = 1;
 /// Index byte + attribute id: the prefix every segment of one attribute shares.
 pub(crate) const ATTR_PREFIX_LEN: usize = codec::CODEC_LENGTH + codec::ATTRIBUTE_LENGTH;
 
+/// How many datoms share one SlateDB key, and in what shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SegmentLayout {
+    /// One datom per key, empty values.
     Row,
+    /// Row-major segments: up to `segment_size` whole datom keys in one value,
+    /// in every index, keyed by the segment's last datom (see `crate::row_segment`).
+    RowSegments { segment_size: usize },
+    /// AEV/AVE packed into struct-of-arrays segments, AE/AV served from the first column.
     Columnar { segment_size: usize },
 }
 
 impl SegmentLayout {
-    /// `TRIPLOX_SEGMENT_LAYOUT=columnar` selects segments, `TRIPLOX_SEGMENT_SIZE` sizes them.
+    /// `TRIPLOX_SEGMENT_LAYOUT` picks the shape (`row`, `row-segments`, `columnar`)
+    /// and `TRIPLOX_SEGMENT_SIZE` sizes the segments of the two segmented shapes.
     pub fn from_env() -> Self {
         static LAYOUT: OnceLock<SegmentLayout> = OnceLock::new();
         *LAYOUT.get_or_init(|| {
-            let columnar = std::env::var("TRIPLOX_SEGMENT_LAYOUT")
-                .map(|v| v.eq_ignore_ascii_case("columnar"))
-                .unwrap_or(false);
-            if !columnar {
-                return SegmentLayout::Row;
-            }
+            let name = std::env::var("TRIPLOX_SEGMENT_LAYOUT").unwrap_or_default();
             let segment_size = std::env::var("TRIPLOX_SEGMENT_SIZE")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|n: &usize| *n > 0)
                 .unwrap_or(DEFAULT_SEGMENT_SIZE);
-            SegmentLayout::Columnar { segment_size }
+            if name.eq_ignore_ascii_case("columnar") {
+                SegmentLayout::Columnar { segment_size }
+            } else if name.eq_ignore_ascii_case("row-segments") && segment_size > 1 {
+                SegmentLayout::RowSegments { segment_size }
+            } else {
+                SegmentLayout::Row
+            }
         })
     }
 
@@ -78,10 +86,16 @@ impl SegmentLayout {
         matches!(self, SegmentLayout::Columnar { .. })
     }
 
+    /// True when one SlateDB value holds several whole datom keys.
+    pub fn is_row_segments(&self) -> bool {
+        matches!(self, SegmentLayout::RowSegments { .. })
+    }
+
     pub fn segment_size(&self) -> usize {
         match self {
             SegmentLayout::Row => 1,
-            SegmentLayout::Columnar { segment_size } => *segment_size,
+            SegmentLayout::RowSegments { segment_size }
+            | SegmentLayout::Columnar { segment_size } => *segment_size,
         }
     }
 }

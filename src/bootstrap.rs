@@ -9,6 +9,7 @@ use crate::partition::{
     extract_counter, partition_entity_prefix, COUNTER_BITS, DB_PARTITION, TX_PARTITION,
     USER_PARTITION,
 };
+use crate::row_segment::KeyCursor;
 use crate::schema::{bootstrap_schema, bootstrap_schema_tx, load_schema_from_indices, Schema};
 use crate::segment::SegmentLayout;
 use crate::slate::{SlateComponents, DEFAULT_SCAN_OPTIONS, DEFAULT_WRITE_OPTIONS};
@@ -46,14 +47,13 @@ pub(crate) async fn scan_partition_counters(slatedb: &Db) -> Result<PartitionMap
         pm.insert(partition, 0);
 
         let prefix = concat_bytes(&[&[codec::EAV], &partition_entity_prefix(partition)]);
-        let mut iter = slatedb
-            .scan_prefix_with_options(&prefix, .., &DEFAULT_SCAN_OPTIONS)
+        let mut iter = KeyCursor::scan_prefix(slatedb, &prefix)
             .await
             .context("Failed to scan EAV partition prefix")?;
 
-        if let Some(kv) = iter.next().await.context("Failed to read EAV key")? {
+        if let Some(key) = iter.next().await.context("Failed to read EAV key")? {
             let mut cursor: &[u8] =
-                &kv.key[codec::CODEC_LENGTH..codec::CODEC_LENGTH + codec::ENTITY_LENGTH];
+                &key[codec::CODEC_LENGTH..codec::CODEC_LENGTH + codec::ENTITY_LENGTH];
             let eid = match codec::decode_datatype(&mut cursor)
                 .context("Failed to decode entity ID from EAV key")?
             {

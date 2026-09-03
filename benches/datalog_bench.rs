@@ -200,6 +200,26 @@ async fn main() {
         "vertices={vertices} edges={} edge_prob={edge_prob} runs={runs} ingest_ms={ingest_ms:.1}",
         edges.len()
     );
+    let storage = node.index_storage().await.expect("index storage");
+    println!(
+        "{:<6} {:>10} {:>10} {:>12} {:>12}",
+        "index", "keys", "datoms", "key_bytes", "value_bytes"
+    );
+    for s in &storage {
+        println!(
+            "{:<6} {:>10} {:>10} {:>12} {:>12}",
+            s.index, s.keys, s.datoms, s.key_bytes, s.value_bytes
+        );
+    }
+    let storage_json: Vec<String> = storage
+        .iter()
+        .map(|s| {
+            format!(
+                "{{\"index\":\"{}\",\"keys\":{},\"datoms\":{},\"key_bytes\":{},\"value_bytes\":{}}}",
+                s.index, s.keys, s.datoms, s.key_bytes, s.value_bytes
+            )
+        })
+        .collect();
     println!(
         "{:<22} {:>10} {:>12} {:>12} {:>10} {:>10} {:>8}",
         "query", "rows", "min_ms", "median_ms", "v_skips", "t_skips", "build_ms"
@@ -263,8 +283,9 @@ async fn main() {
 
     if let Ok(path) = std::env::var("BENCH_OUT") {
         let body = format!(
-            "{{\"vertices\":{vertices},\"edges\":{},\"edge_prob\":{edge_prob},\"ingest_ms\":{ingest_ms:.1},\"queries\":[{}]}}\n",
+            "{{\"vertices\":{vertices},\"edges\":{},\"edge_prob\":{edge_prob},\"ingest_ms\":{ingest_ms:.1},\"storage\":[{}],\"queries\":[{}]}}\n",
             edges.len(),
+            storage_json.join(","),
             json.join(",")
         );
         std::fs::write(&path, body).expect("write BENCH_OUT");

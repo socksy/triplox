@@ -14,6 +14,7 @@ use crate::iterator::slate_key_iterator::SlateKeyIterator;
 use crate::metadata::PartitionMap;
 use crate::ops::{DataType, Datom, DatomOp, Entid, EntityRef, TxOp};
 use crate::partition::{extract_partition, DB_PARTITION, TX_PARTITION};
+use crate::row_segment::KeyCursor;
 use crate::schema::{Schema, Unique, ValueType, DB_TX_ABORTED, DB_TX_COMMITTED};
 use crate::segment::SegmentLayout;
 use crate::slate::DEFAULT_SCAN_OPTIONS;
@@ -633,12 +634,10 @@ where
     let ave_keys = if layout.is_columnar() {
         crate::segment::row_keys_with_prefix(sdb, &ave_prefix).await?
     } else {
-        let mut iter = sdb
-            .scan_prefix_with_options(&ave_prefix, .., &DEFAULT_SCAN_OPTIONS)
-            .await?;
+        let mut iter = KeyCursor::scan_prefix(sdb, &ave_prefix).await?;
         let mut keys = Vec::new();
-        while let Some(kv) = iter.next().await? {
-            keys.push(kv.key);
+        while let Some(key) = iter.next().await? {
+            keys.push(key);
         }
         keys
     };
@@ -663,13 +662,11 @@ where
     let mut entity_buf = Vec::new();
     encode_datatype(&DataType::Long(tx_eid), &mut entity_buf);
     let eav_prefix = concat_bytes(&[&[codec::EAV], &entity_buf]);
-    let mut iter = sdb
-        .scan_prefix_with_options(&eav_prefix, .., &DEFAULT_SCAN_OPTIONS)
-        .await?;
+    let mut iter = KeyCursor::scan_prefix(sdb, &eav_prefix).await?;
     let mut tx_result: Option<i64> = None;
     let mut tx_error: Option<String> = None;
-    while let Some(kv) = iter.next().await? {
-        let (_entity, attribute, value, _tx_eid, op) = eav_key_to_parts(kv.key)?;
+    while let Some(key) = iter.next().await? {
+        let (_entity, attribute, value, _tx_eid, op) = eav_key_to_parts(key)?;
         if op == codec::RETRACT {
             continue;
         }

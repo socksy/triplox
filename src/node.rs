@@ -68,7 +68,62 @@ impl SchemaProvider for tokio::sync::RwLock<Indexer> {
     }
 }
 
+/// Physical size of one index in SlateDB.
+#[derive(Debug, Clone)]
+pub struct IndexStorage {
+    pub index: &'static str,
+    pub keys: u64,
+    pub datoms: u64,
+    pub key_bytes: u64,
+    pub value_bytes: u64,
+}
+
 impl<L: TxLog> Node<L> {
+    /// Scan every index and report SlateDB key count and bytes, for storage experiments.
+    pub async fn index_storage(&self) -> Result<Vec<IndexStorage>, Error> {
+        let mut out = Vec::new();
+        for (index, name) in [
+            (crate::codec::EAV, "EAV"),
+            (crate::codec::AVE, "AVE"),
+            (crate::codec::AEV, "AEV"),
+            (crate::codec::AE, "AE"),
+            (crate::codec::AV, "AV"),
+            (crate::codec::VAE, "VAE"),
+        ] {
+            let mut iter = self
+                .slate
+                .db
+                .scan_with_options(
+                    vec![index]..vec![index + 1],
+                    &crate::slate::DEFAULT_SCAN_OPTIONS,
+                )
+                .await?;
+            let mut stats = IndexStorage {
+                index: name,
+                keys: 0,
+                datoms: 0,
+                key_bytes: 0,
+                value_bytes: 0,
+            };
+            while let Some(kv) = iter.next().await? {
+                stats.keys += 1;
+                stats.key_bytes += kv.key.len() as u64;
+                stats.value_bytes += kv.value.len() as u64;
+                // Each layout counts datoms per entry its own way.
+                stats.datoms += match self.layout {
+                    SegmentLayout::Columnar { .. }
+                        if crate::segment::is_segmented_index(index) && !kv.value.is_empty() =>
+                    {
+                        crate::segment::Segment::count(&kv.value)? as u64
+                    }
+                    _ => crate::row_segment::decode_segment(&kv.key, &kv.value)?.len() as u64,
+                };
+            }
+            out.push(stats);
+        }
+        Ok(out)
+    }
+
     /// Shared setup: bootstrap the database, ensure the log's bootstrap record,
     /// subscribe the indexer, and wait for catch-up of un-indexed log records.
     async fn from_slate_and_tx_log(

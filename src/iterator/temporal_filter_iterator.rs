@@ -7,7 +7,7 @@ use slatedb::{DbMetadataOps, DbReadOps};
 use tokio::runtime::Handle;
 
 use crate::codec;
-use crate::slate::DEFAULT_SCAN_OPTIONS;
+use crate::row_segment::KeyCursor;
 use crate::util::next_prefix;
 use crate::zone_map::ZoneMap;
 
@@ -27,7 +27,7 @@ pub(crate) struct TemporalFilterIterator<M>
 where
     M: DbMetadataOps + Send + Sync,
 {
-    inner: slatedb::DbIterator,
+    inner: KeyCursor,
     current_key: Option<Bytes>,
     prefix: Bytes,
     handle: Handle,
@@ -76,8 +76,7 @@ where
     {
         let prefix_bytes = Bytes::from(prefix.to_vec());
         let as_of_encoded = codec::encode_i64_bytes(as_of);
-        let iterator =
-            handle.block_on(slate.scan_prefix_with_options(prefix, .., &DEFAULT_SCAN_OPTIONS))?;
+        let iterator = handle.block_on(KeyCursor::scan_prefix(slate, prefix))?;
 
         let mut iter = Self {
             inner: iterator,
@@ -101,7 +100,7 @@ where
         // Assumes prefix-free value encodings
         match next_prefix(logical_key(key)) {
             Some(target) => {
-                self.handle.block_on(self.inner.seek(Bytes::from(target)))?;
+                self.handle.block_on(self.inner.seek(&target))?;
                 Ok(true)
             }
             None => Ok(false),
@@ -118,8 +117,7 @@ where
                     self.current_key = None;
                     return Ok(());
                 }
-                Some(kv) => {
-                    let key = kv.key;
+                Some(key) => {
                     assert!(
                         key.len() >= codec::TX_EID_OP_SUFFIX,
                         "Key too short ({} bytes) to contain tx_eid + op suffix",
@@ -149,7 +147,7 @@ where
                         .and_then(|zm| zm.newer_run_end(&key, &self.as_of_encoded))
                     {
                         if end.starts_with(&self.prefix) {
-                            self.handle.block_on(self.inner.seek(end.clone()))?;
+                            self.handle.block_on(self.inner.seek(&end))?;
                         } else {
                             // The run extends past this scan's prefix: nothing visible remains.
                             self.current_key = None;
@@ -190,17 +188,16 @@ where
     fn seek(&mut self, extension: Bytes) -> Result<(), Error> {
         let mut full_key = self.prefix.to_vec();
         full_key.extend_from_slice(&extension);
-        let full_key = Bytes::from(full_key);
 
         // Skip forward if already past the target
         if let Some(current) = &self.current_key {
             let current_logical = logical_key(current);
-            if current_logical >= full_key.as_ref() {
+            if current_logical >= full_key.as_slice() {
                 return Ok(());
             }
         }
 
-        self.handle.block_on(self.inner.seek(full_key))?;
+        self.handle.block_on(self.inner.seek(&full_key))?;
         self.advance_to_next_valid()
     }
 

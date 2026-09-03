@@ -23,6 +23,7 @@ pub mod ops;
 pub mod partition;
 mod query;
 mod query_validation;
+mod row_segment;
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod schema;
 #[cfg(not(any(test, feature = "test-helpers")))]
@@ -42,6 +43,8 @@ pub mod config;
 pub mod node;
 pub mod server;
 
-pub use node::{Database, IntoQuery, Node, QueryNode, SubmitNode, TransactionResult, TxKey, DB};
+pub use node::{
+    Database, IndexStorage, IntoQuery, Node, QueryNode, SubmitNode, TransactionResult, TxKey, DB,
+};
 pub use segment::SegmentLayout;
 pub use triplox_client::{client, msgpack_codec, protocol, subscription, transaction};

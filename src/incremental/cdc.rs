@@ -19,6 +19,7 @@ use crate::indexer::eav_key_to_parts;
 use crate::node::SchemaProvider;
 use crate::ops::{DataType, Datom, DatomOp};
 use crate::partition::{extract_counter, extract_partition, TX_PARTITION};
+use crate::row_segment::KeyCursor;
 use crate::schema::Schema;
 use crate::slate::cdc::{CdcCursor, CdcStream};
 use crate::slate::DEFAULT_SCAN_OPTIONS;
@@ -144,15 +145,10 @@ where
         .collect::<HashSet<_>>();
     let mut latest_by_triple: HashMap<EncodedTriple, (i64, u8)> = HashMap::new();
     // TODO: This needs to be done efficiently via AVE/AEV using attribute and query constants. See #329.
-    let mut iter = db
-        .scan_with_options(
-            concat_bytes(&[&[codec::EAV]])..vec![codec::EAV_END],
-            &DEFAULT_SCAN_OPTIONS,
-        )
-        .await?;
+    let mut iter = KeyCursor::scan_prefix(db, &[codec::EAV]).await?;
 
-    while let Some(kv) = iter.next().await? {
-        let (entity, attribute, value, tx_eid, op) = eav_key_to_parts(kv.key)?;
+    while let Some(key) = iter.next().await? {
+        let (entity, attribute, value, tx_eid, op) = eav_key_to_parts(key)?;
         if tx_eid > as_of_tx_eid || !attributes.contains(&attribute) {
             continue;
         }

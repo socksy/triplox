@@ -140,6 +140,9 @@ where
             {
                 (prefix.to_vec(), segment_size)
             }
+            // Row-major segments cover every index and store whole keys, so nothing is
+            // rewritten; only the key-count-to-datom-count scale changes.
+            (SegmentLayout::RowSegments { segment_size }, _) => (prefix.to_vec(), segment_size),
             _ => (prefix.to_vec(), 1),
         };
         let count = self.db.handle().block_on(

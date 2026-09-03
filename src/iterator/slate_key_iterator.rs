@@ -1,19 +1,17 @@
 use anyhow::Result;
 use bytes::Bytes;
 
-use crate::slate::DEFAULT_SCAN_OPTIONS;
+use crate::row_segment::KeyCursor;
 
 pub(crate) struct SlateKeyIterator {
-    inner: slatedb::DbIterator,
+    inner: KeyCursor,
     current_key: Option<Bytes>,
 }
 
 impl SlateKeyIterator {
     pub async fn scan_prefix(db: &slatedb::Db, prefix: &[u8]) -> Result<Self> {
-        let mut inner = db
-            .scan_prefix_with_options(prefix, .., &DEFAULT_SCAN_OPTIONS)
-            .await?;
-        let current_key = inner.next().await?.map(|kv| kv.key);
+        let mut inner = KeyCursor::scan_prefix(db, prefix).await?;
+        let current_key = inner.next().await?;
         Ok(Self { inner, current_key })
     }
 
@@ -24,13 +22,13 @@ impl SlateKeyIterator {
             }
         }
 
-        self.inner.seek(Bytes::copy_from_slice(key)).await?;
-        self.current_key = self.inner.next().await?.map(|kv| kv.key);
+        self.inner.seek(key).await?;
+        self.current_key = self.inner.next().await?;
         Ok(())
     }
 
     pub async fn next(&mut self) -> Result<Option<Bytes>> {
-        self.current_key = self.inner.next().await?.map(|kv| kv.key);
+        self.current_key = self.inner.next().await?;
         Ok(self.current_key.clone())
     }
 
