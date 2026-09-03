@@ -380,8 +380,10 @@ impl Segment {
         Ok(Segment {
             index,
             first: Column::decode(first, n)?,
+            // n+1 zero offsets: every second entry reads as empty, so key
+            // comparisons see only the first column.
             second: Column::Raw {
-                offsets: vec![0],
+                offsets: vec![0; n + 1],
                 bytes: Vec::new(),
             },
             ops: ops.to_vec(),

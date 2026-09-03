@@ -10,7 +10,8 @@ use crate::ops::{DataType, EntityRef, TxOp};
 use crate::segment::{Segment, SegmentLayout};
 use crate::slate::DEFAULT_SCAN_OPTIONS;
 use crate::transaction::TxKey;
-use triplox_client::node::{Database, QueryNode, SubmitNode, TransactionResult};
+use triplox_client::node::{Database, QueryNode, SubmitNode};
+use triplox_client::transaction::TransactionResult;
 
 const QUERIES: &[&str] = &[
     "[:find ?a ?b :where [?a :g/to ?b]]",
@@ -132,7 +133,7 @@ async fn results(node: &Node<MemoryLog>, as_of: Option<TxKey>) -> Vec<Vec<Vec<Da
     let mut all = Vec::new();
     for q in QUERIES {
         let mut rows = db.query(*q).await.unwrap_or_else(|e| panic!("{q}: {e}"));
-        rows.sort();
+        rows.sort_by_key(|r| format!("{r:?}"));
         all.push(rows);
     }
     all

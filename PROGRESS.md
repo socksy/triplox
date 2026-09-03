@@ -3,20 +3,25 @@
 ## Goal
 Pack runs of sorted datoms for one attribute into one SlateDB key (keyed by the last datom key so forward seek lands on the right segment) with column-wise encoding: first/second component, op bitmap, tx column; FOR + bit-packing for integer columns, offsets+bytes otherwise. Column-only reads for AE/AV-style scans. Toggle: layout switch (see src/segment.rs and how bootstrap/node pass a layout). Ingest may be slow but must be correct. Temporal filtering must work via the tx column.
 
-## Status (as of hand-off)
-- Compiles (cargo check --all-targets clean).
-- New: src/segment.rs (format, encode/decode, segmentation rules in module doc), src/iterator/segment_iterator.rs (ScanMode Pair/First, temporal version resolution per logical key).
-- Modified: bootstrap.rs (init_db_with_layout), db_value.rs, indexer.rs (write path), iterator/mod.rs, lib.rs, node.rs, query/patterns/triple.rs, tx.rs (lookup_tx_completion takes a layout).
-- Toggle verified plumbed end to end: `SegmentLayout::from_env()` is read in bootstrap, indexer, node, db_value; the query engine picks SegmentIterator in query/patterns/triple.rs:148. Only tx.rs lookup_tx_completion reads AEV/AVE outside the query engine and it is layout-aware.
-- Added src/segment_layout_test.rs: row-vs-columnar equivalence over 9 queries (current + as-of), plus a per-index key/byte/datom-count storage report.
-- NOTE: the machine disk hit 100%. Freed this worktree's target/{debug,release}/incremental. Build with CARGO_INCREMENTAL=0 and keep an eye on `df -h`.
+## Status
+
+- Compiles clean. Toggle plumbed end to end via `SegmentLayout::from_env()` (`TRIPLOX_SEGMENT_LAYOUT=columnar`, `TRIPLOX_SEGMENT_SIZE`): bootstrap.rs, indexer.rs, node.rs, db_value.rs all read it; the query engine picks `SegmentIterator` in src/query/patterns/triple.rs:148. Only `tx::lookup_tx_completion` reads AEV/AVE outside the query engine and it is layout-aware.
+- src/segment_layout_test.rs: row-vs-columnar equivalence over 9 queries (current DB and as-of a pre-retraction tx) plus a per-index key/byte/datom-count storage report. **PASSES.**
+- Fixed a real bug: `Segment::decode_first_column` left the second column with one offset, so any AE/AV `lower_bound`/`cmp_key` panicked (index out of bounds). Now n+1 zero offsets so second reads as empty.
+- Equivalence-test storage report (30 vertices, ~87 edges, segment_size 64):
+  row: 1165 keys, 36289 bytes total. columnar: 335 keys, 16421 bytes total (-55%). AEV datoms 247 == 247.
+
+### Disk hazard (read this)
+The machine disk hit 100% repeatedly; five agents build concurrently. Two things matter:
+- Build with debug info off, which cuts this worktree's target from ~3.2G to ~1.6G:
+  `export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=off CARGO_PROFILE_BENCH_DEBUG=0`
+- When bash tool calls fail with ENOSPC the command does not run at all. Check `df -h /System/Volumes/Data` first.
+`target/debug` and `target/release` were deleted once each to make room (no `cargo clean`).
 
 ## Next
-1. Run the equivalence test (cargo test -p triplox --lib segment_layout -- --nocapture) and record the storage report.
-2. Equivalence test across layouts on a small graph (include an as-of query).
-3. cargo test -p triplox, clippy.
-4. A/B bench; report SlateDB key count and bytes per index before/after and ingest_ms.
-5. EXPERIMENT.md, fmt, commit.
+1. Full `cargo test -p triplox` + `cargo clippy -p triplox --all-targets`.
+2. Interleaved A/B bench, 3 runs each, JSON to results/columnar-storage-{off,on}.json.
+3. EXPERIMENT.md, fmt, commit.
 
 ## Shared context
 
