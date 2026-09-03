@@ -5,6 +5,7 @@ use edn::query::Variable;
 
 mod evaluation;
 
+pub(crate) mod adjacency;
 pub(crate) mod function;
 pub(crate) mod not;
 pub(crate) mod or;

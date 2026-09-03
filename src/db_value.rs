@@ -6,6 +6,7 @@ use tokio::runtime::Handle;
 use crate::indexer::latest_tx_key_from_sdb;
 use crate::ops::QueryArg;
 use crate::partition::tx_eid_from_tx_id;
+use crate::query::adjacency::{AdjMatrix, AdjacencyCache};
 use crate::query::{execute_query, QueryResult};
 use crate::schema::IdentMap;
 use crate::segment::SegmentLayout;
@@ -23,6 +24,14 @@ where
     tx_key: TxKey,
     range_stats: Arc<slatedb_estimates::RangeStats<M>>,
     layout: SegmentLayout,
+    // Present only when ref-attribute patterns should be served from adjacency matrices.
+    adjacency: Option<Adjacency>,
+}
+
+#[derive(Clone)]
+pub(crate) struct Adjacency {
+    cache: Arc<AdjacencyCache>,
+    ref_attributes: Arc<std::collections::HashSet<i64>>,
 }
 
 impl<D, M> Clone for DB<D, M>
@@ -38,6 +47,7 @@ where
             tx_key: self.tx_key,
             range_stats: Arc::clone(&self.range_stats),
             layout: self.layout,
+            adjacency: self.adjacency.clone(),
         }
     }
 }
@@ -62,6 +72,36 @@ where
             tx_key,
             range_stats,
             layout: SegmentLayout::from_env(),
+            adjacency: None,
+        }
+    }
+
+    /// Serve ref-attribute triple patterns from cached adjacency matrices.
+    pub(crate) fn with_adjacency(
+        mut self,
+        cache: Arc<AdjacencyCache>,
+        ref_attributes: std::collections::HashSet<i64>,
+    ) -> Self {
+        self.adjacency = Some(Adjacency {
+            cache,
+            ref_attributes: Arc::new(ref_attributes),
+        });
+        self
+    }
+
+    pub(crate) fn without_adjacency(mut self) -> Self {
+        self.adjacency = None;
+        self
+    }
+
+    /// The adjacency matrix for `attribute`, or None when it is not a ref attribute or
+    /// matrices are disabled on this DB value.
+    pub(crate) fn adjacency(&self, attribute: i64) -> Result<Option<Arc<AdjMatrix>>, Error> {
+        match &self.adjacency {
+            Some(adjacency) if adjacency.ref_attributes.contains(&attribute) => {
+                adjacency.cache.get_or_build(self, attribute).map(Some)
+            }
+            _ => Ok(None),
         }
     }
 
@@ -85,6 +125,7 @@ where
             tx_key,
             range_stats,
             layout: SegmentLayout::from_env(),
+            adjacency: None,
         })
     }
 
