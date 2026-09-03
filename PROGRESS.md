@@ -10,9 +10,11 @@ RedisGraph/GraphBLAS-style: per (ref attribute, basis) build CSR adjacency from 
 - Toggle: env var `TRIPLOX_ADJ_MATRIX=1` (src/node.rs `adjacency_matrix_enabled`). `TRIPLOX_ADJ_MATRIX_LOG` prints per-matrix nnz/bytes/build_ms.
 - Equivalence test `query::patterns::adjacency::tests::adjacency_path_matches_iterator_path` PASSES (11 queries, on vs off, 40-vertex graph incl. a retraction). The previously broken query was not the not-clause one but a repeated-variable self-loop pattern (`[?a :g/to ?a]`), which the engine does not support at all; it was replaced by a both-sides-constant validate-path query.
 
+- `cargo test -p triplox` PASSES: 610 lib + 32 integration, 0 failed (both with the toggle off and with `TRIPLOX_ADJ_MATRIX=1`, i.e. the whole suite is a second equivalence check).
+- `cargo clippy -p triplox --all-targets` PASSES with zero warnings.
+
 ## Next
-1. cargo test -p triplox (full), clippy.
-2. A/B bench (3 off / 3 on, alternating), plus VERTICES=5000 EDGE_PROB=0.004 once if time allows. Record matrix build time and memory.
+1. A/B bench (3 off / 3 on, alternating), plus VERTICES=5000 EDGE_PROB=0.004 once if time allows. Record matrix build time and memory.
 3. EXPERIMENT.md, fmt, commit.
 
 ## Shared context
