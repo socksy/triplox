@@ -26,8 +26,9 @@ mid-link when it is low; just retry. I deleted only this worktree's `target/rele
 `target/tmp/retry_tests.sh <log> <cmd...>` waits for headroom and retries on ENOSPC.
 
 ## Next
-1. A/B interleaved bench, 3 runs each, ASOF=1; write the two JSON files.
-2. EXPERIMENT.md, `cargo fmt`, commit.
+1. Fold the reversed-order control passes (on_4/5, off_4/5) into EXPERIMENT.md's noise section.
+2. Optional follow-up, not started: build the temporal zone map lazily so head-basis queries
+   stop paying for a map that can never skip anything (see EXPERIMENT.md, "What failed").
 
 ## Shared context
 
