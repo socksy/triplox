@@ -159,63 +159,22 @@ pub(crate) fn set_bits(words: &[u64]) -> impl Iterator<Item = usize> + '_ {
 // Word-parallel kernels
 // ---------------------------------------------------------------------------
 
-/// `dst |= src`. Slices must be the same length and a multiple of two words.
+/// `dst |= src`. Both slices must be the same length.
 pub(crate) fn or_into(dst: &mut [u64], src: &[u64]) {
     debug_assert_eq!(dst.len(), src.len());
     #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: NEON is unconditionally present on aarch64, and the loop reads and
-        // writes two in-bounds u64 lanes per step from equally long slices.
-        unsafe {
-            use std::arch::aarch64::{vld1q_u64, vorrq_u64, vst1q_u64};
-            let chunks = dst.len() / 2;
-            let (dst_ptr, src_ptr) = (dst.as_mut_ptr(), src.as_ptr());
-            for chunk in 0..chunks {
-                let offset = chunk * 2;
-                let a = vld1q_u64(dst_ptr.add(offset));
-                let b = vld1q_u64(src_ptr.add(offset));
-                vst1q_u64(dst_ptr.add(offset), vorrq_u64(a, b));
-            }
-            for lane in chunks * 2..dst.len() {
-                dst[lane] |= src[lane];
-            }
-        }
-        return;
-    }
+    neon::or_into(dst, src);
     #[cfg(not(target_arch = "aarch64"))]
     for (lhs, rhs) in dst.iter_mut().zip(src) {
         *lhs |= *rhs;
     }
 }
 
-/// Population count of `left & right`, i.e. one entry of the masked product.
+/// Population count of `left & right`, i.e. one entry of a masked product.
 pub(crate) fn and_popcount(left: &[u64], right: &[u64]) -> u64 {
     debug_assert_eq!(left.len(), right.len());
     #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: NEON is unconditionally present on aarch64, and every load reads two
-        // in-bounds u64 lanes from equally long slices.
-        unsafe {
-            use std::arch::aarch64::{
-                vaddvq_u8, vandq_u64, vcntq_u8, vld1q_u64, vreinterpretq_u8_u64,
-            };
-            let chunks = left.len() / 2;
-            let (left_ptr, right_ptr) = (left.as_ptr(), right.as_ptr());
-            let mut total: u64 = 0;
-            for chunk in 0..chunks {
-                let offset = chunk * 2;
-                let a = vld1q_u64(left_ptr.add(offset));
-                let b = vld1q_u64(right_ptr.add(offset));
-                let bytes = vreinterpretq_u8_u64(vandq_u64(a, b));
-                // 16 lanes of at most 8 bits set, so the u8 horizontal sum cannot overflow.
-                total += u64::from(vaddvq_u8(vcntq_u8(bytes)));
-            }
-            for lane in chunks * 2..left.len() {
-                total += u64::from((left[lane] & right[lane]).count_ones());
-            }
-            return total;
-        }
-    }
+    return neon::and_popcount(left, right);
     #[cfg(not(target_arch = "aarch64"))]
     left.iter()
         .zip(right)
@@ -226,25 +185,79 @@ pub(crate) fn and_popcount(left: &[u64], right: &[u64]) -> u64 {
 /// Population count of a bit set.
 pub(crate) fn popcount(words: &[u64]) -> u64 {
     #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: NEON is unconditionally present on aarch64 and every load is in bounds.
-        unsafe {
-            use std::arch::aarch64::{vaddvq_u8, vcntq_u8, vld1q_u64, vreinterpretq_u8_u64};
-            let chunks = words.len() / 2;
-            let ptr = words.as_ptr();
-            let mut total: u64 = 0;
-            for chunk in 0..chunks {
-                let value = vld1q_u64(ptr.add(chunk * 2));
-                total += u64::from(vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(value))));
-            }
-            for lane in chunks * 2..words.len() {
-                total += u64::from(words[lane].count_ones());
-            }
-            return total;
-        }
-    }
+    return neon::popcount(words);
     #[cfg(not(target_arch = "aarch64"))]
     words.iter().map(|w| u64::from(w.count_ones())).sum()
+}
+
+/// 128 bits per instruction. NEON is part of the aarch64 baseline, so no runtime
+/// feature detection is needed and the intrinsics are always available here.
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use std::arch::aarch64::{
+        vaddvq_u8, vandq_u64, vcntq_u8, vld1q_u64, vorrq_u64, vreinterpretq_u8_u64, vst1q_u64,
+    };
+
+    pub(super) fn or_into(dst: &mut [u64], src: &[u64]) {
+        let chunks = dst.len() / 2;
+        // SAFETY: each step reads and writes two in-bounds u64 lanes of equally long slices.
+        unsafe {
+            let (dst_ptr, src_ptr) = (dst.as_mut_ptr(), src.as_ptr());
+            for offset in (0..chunks * 2).step_by(2) {
+                let merged = vorrq_u64(
+                    vld1q_u64(dst_ptr.add(offset)),
+                    vld1q_u64(src_ptr.add(offset)),
+                );
+                vst1q_u64(dst_ptr.add(offset), merged);
+            }
+        }
+        for (lhs, rhs) in dst.iter_mut().zip(src).skip(chunks * 2) {
+            *lhs |= *rhs;
+        }
+    }
+
+    pub(super) fn and_popcount(left: &[u64], right: &[u64]) -> u64 {
+        let chunks = left.len() / 2;
+        let mut total: u64 = 0;
+        // SAFETY: each load reads two in-bounds u64 lanes of equally long slices.
+        unsafe {
+            let (left_ptr, right_ptr) = (left.as_ptr(), right.as_ptr());
+            for offset in (0..chunks * 2).step_by(2) {
+                let masked = vandq_u64(
+                    vld1q_u64(left_ptr.add(offset)),
+                    vld1q_u64(right_ptr.add(offset)),
+                );
+                // 16 byte lanes of at most 8 bits, so the u8 horizontal sum cannot overflow.
+                total += u64::from(vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(masked))));
+            }
+        }
+        total
+            + left
+                .iter()
+                .zip(right)
+                .skip(chunks * 2)
+                .map(|(a, b)| u64::from((a & b).count_ones()))
+                .sum::<u64>()
+    }
+
+    pub(super) fn popcount(words: &[u64]) -> u64 {
+        let chunks = words.len() / 2;
+        let mut total: u64 = 0;
+        // SAFETY: each load reads two in-bounds u64 lanes.
+        unsafe {
+            let ptr = words.as_ptr();
+            for offset in (0..chunks * 2).step_by(2) {
+                let value = vld1q_u64(ptr.add(offset));
+                total += u64::from(vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(value))));
+            }
+        }
+        total
+            + words
+                .iter()
+                .skip(chunks * 2)
+                .map(|w| u64::from(w.count_ones()))
+                .sum::<u64>()
+    }
 }
 
 /// Lazily built dense form of one adjacency orientation.

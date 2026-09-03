@@ -341,7 +341,7 @@ fn uniform<'a>(hops: &[&'a AdjMatrix]) -> Option<&'a AdjMatrix> {
         .then_some(first)
 }
 
-fn hop_row<'a>(matrix: &'a AdjMatrix, node: i64, backwards: bool) -> &'a [i64] {
+fn hop_row(matrix: &AdjMatrix, node: i64, backwards: bool) -> &[i64] {
     if backwards {
         matrix.inn.row(node)
     } else {
@@ -527,6 +527,102 @@ fn intersection_len(left: &[i64], right: &[i64]) -> usize {
     hits
 }
 
+// ---------------------------------------------------------------------------
+// Dense kernels
+// ---------------------------------------------------------------------------
+
+/// Path counts as a dense vector over the node index, one hop per iteration.
+fn chain_paths_dense(
+    matrix: &AdjMatrix,
+    bits: &BitMatrix,
+    hops: usize,
+    seed: Option<&[i64]>,
+    backwards: bool,
+) -> u128 {
+    let index = bits.index();
+    let mut current = vec![0u128; index.len()];
+    match seed {
+        Some(seed) => {
+            for node in seed {
+                if let Some(position) = index.position(*node) {
+                    current[position] = 1;
+                }
+            }
+        }
+        None => current.fill(1),
+    }
+    for _ in 0..hops {
+        let mut next = vec![0u128; index.len()];
+        for (position, weight) in current.iter().enumerate() {
+            if *weight == 0 {
+                continue;
+            }
+            for target in hop_row(matrix, index.id(position), backwards) {
+                if let Some(target) = index.position(*target) {
+                    next[target] += weight;
+                }
+            }
+        }
+        current = next;
+    }
+    current.iter().sum()
+}
+
+/// Endpoints of the chain as a bit set: `hops` boolean matrix-vector products.
+fn chain_reachable_bits(bits: &BitMatrix, hops: usize, seed: Option<&[i64]>) -> usize {
+    let mut current = match seed {
+        Some(seed) => bits.row_of_ids(seed),
+        None => bits.all_rows(),
+    };
+    for _ in 0..hops {
+        current = bits.spread(&current);
+    }
+    popcount(&current) as usize
+}
+
+/// Chain starts that complete a whole path, found by walking the mask back to front.
+fn chain_sources_bits(bits: &BitMatrix, hops: usize, seed: Option<&[i64]>) -> usize {
+    let mut live: Option<Vec<u64>> = None;
+    for _ in 0..hops {
+        let mut next = bits.zero_row();
+        for position in 0..bits.index().len() {
+            let row = bits.row(position);
+            let reaches = match &live {
+                None => popcount(row) > 0,
+                Some(live) => and_popcount(row, live) > 0,
+            };
+            if reaches {
+                next[position / 64] |= 1u64 << (position % 64);
+            }
+        }
+        live = Some(next);
+    }
+    let live = live.unwrap_or_else(|| bits.zero_row());
+    match seed {
+        Some(seed) => and_popcount(&live, &bits.row_of_ids(seed)) as usize,
+        None => popcount(&live) as usize,
+    }
+}
+
+/// Triangles as the masked product `sum(A2 masked by A1) . A3`, one AND+popcount per
+/// (apex, mid) pair.
+fn triangle_bits(matrix: &AdjMatrix, bits: &BitMatrix) -> u128 {
+    let index = bits.index();
+    let mut count: u128 = 0;
+    for apex in 0..index.len() {
+        let tips = bits.row(apex);
+        if popcount(tips) == 0 {
+            continue;
+        }
+        for mid in matrix.out.row(index.id(apex)) {
+            if let Some(mid) = index.position(*mid) {
+                count += u128::from(and_popcount(bits.row(mid), tips));
+            }
+        }
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,7 +764,7 @@ mod tests {
         let mut pairs = Vec::new();
         for i in 0..nodes {
             for j in 0..nodes {
-                if i != j && rng.next() % 5 == 0 {
+                if i != j && rng.next().is_multiple_of(5) {
                     pairs.push((i, j));
                     edges.push(TxOp::Add {
                         entity: EntityRef::Id(eid[i as usize]),
@@ -787,100 +883,4 @@ mod tests {
         .unwrap();
         node.close().await.unwrap();
     }
-}
-
-// ---------------------------------------------------------------------------
-// Dense kernels
-// ---------------------------------------------------------------------------
-
-/// Path counts as a dense vector over the node index, one hop per iteration.
-fn chain_paths_dense(
-    matrix: &AdjMatrix,
-    bits: &BitMatrix,
-    hops: usize,
-    seed: Option<&[i64]>,
-    backwards: bool,
-) -> u128 {
-    let index = bits.index();
-    let mut current = vec![0u128; index.len()];
-    match seed {
-        Some(seed) => {
-            for node in seed {
-                if let Some(position) = index.position(*node) {
-                    current[position] = 1;
-                }
-            }
-        }
-        None => current.fill(1),
-    }
-    for _ in 0..hops {
-        let mut next = vec![0u128; index.len()];
-        for (position, weight) in current.iter().enumerate() {
-            if *weight == 0 {
-                continue;
-            }
-            for target in hop_row(matrix, index.id(position), backwards) {
-                if let Some(target) = index.position(*target) {
-                    next[target] += weight;
-                }
-            }
-        }
-        current = next;
-    }
-    current.iter().sum()
-}
-
-/// Endpoints of the chain as a bit set: `hops` boolean matrix-vector products.
-fn chain_reachable_bits(bits: &BitMatrix, hops: usize, seed: Option<&[i64]>) -> usize {
-    let mut current = match seed {
-        Some(seed) => bits.row_of_ids(seed),
-        None => bits.all_rows(),
-    };
-    for _ in 0..hops {
-        current = bits.spread(&current);
-    }
-    popcount(&current) as usize
-}
-
-/// Chain starts that complete a whole path, found by walking the mask back to front.
-fn chain_sources_bits(bits: &BitMatrix, hops: usize, seed: Option<&[i64]>) -> usize {
-    let mut live: Option<Vec<u64>> = None;
-    for _ in 0..hops {
-        let mut next = bits.zero_row();
-        for position in 0..bits.index().len() {
-            let row = bits.row(position);
-            let reaches = match &live {
-                None => popcount(row) > 0,
-                Some(live) => and_popcount(row, live) > 0,
-            };
-            if reaches {
-                next[position / 64] |= 1u64 << (position % 64);
-            }
-        }
-        live = Some(next);
-    }
-    let live = live.unwrap_or_else(|| bits.zero_row());
-    match seed {
-        Some(seed) => and_popcount(&live, &bits.row_of_ids(seed)) as usize,
-        None => popcount(&live) as usize,
-    }
-}
-
-/// Triangles as the masked product `sum(A2 masked by A1) . A3`, one AND+popcount per
-/// (apex, mid) pair.
-fn triangle_bits(matrix: &AdjMatrix, bits: &BitMatrix) -> u128 {
-    let index = bits.index();
-    let mut count: u128 = 0;
-    for apex in 0..index.len() {
-        let tips = bits.row(apex);
-        if popcount(tips) == 0 {
-            continue;
-        }
-        for mid in matrix.out.row(index.id(apex)) {
-            if let Some(mid) = index.position(*mid) {
-                count += u128::from(and_popcount(bits.row(mid), tips));
-            }
-        }
-    }
-    count
 }
