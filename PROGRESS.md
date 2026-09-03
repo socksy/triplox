@@ -4,10 +4,20 @@
 Per-run (RUN_SIZE keys in key order) min/max of the non-prefix component (V for AEV, E for AVE) plus oldest/newest tx id, per (index, attribute), built in memory by scanning the prefix and cached per basis (sound for any basis <= build basis, see module doc). Planner pushes comparison predicates on a single-pattern variable into the scan as V bounds; iterators skip runs. Toggle: TRIPLOX_ZONE_MAPS=1. Also measure an as-of query at an early basis.
 
 ## Status (as of hand-off)
-- Compiles (cargo check --all-targets clean).
-- New: src/zone_map.rs (ZoneMap build/cache, set_enabled, skip counters).
-- Modified: benches/datalog_bench.rs, db_value.rs, indexer.rs, iterator/temporal_filter_iterator.rs, lib.rs, node.rs, query/plan.rs, query/patterns/triple.rs, query/test_support.rs, schema.rs, slate/mod.rs (SlateComponents carries the maps).
-- Previous agent had just finished the plumbing edits (lib.rs, SlateComponents, DB, four call sites). Unknown whether predicate pushdown in plan.rs is complete or whether the iterator actually consults the map yet. Check by running weight_filter with the toggle on and reading the skip counters.
+- Compiles clean (`cargo check -p triplox --lib --tests`, `cargo check --all-targets`).
+- Plumbing is complete: planner pushdown (src/query/plan.rs), AEV per-entity seek pruning and
+  AV sorted-scan seek/early-exit (src/query/patterns/triple.rs), temporal run skipping
+  (src/iterator/temporal_filter_iterator.rs), cache on SlateComponents (src/slate/mod.rs).
+- New tests in src/zone_map.rs: `results_match_with_zone_maps_on_and_off` (10 queries x
+  {latest, as-of} x {cold cache, warm cache}) and `zone_map_prunes_and_counts_skips`
+  (asserts seeks_checked > 0 and seeks_skipped > 0). NOT YET RUN - see disk note.
+
+### MACHINE DISK IS FULL (blocking)
+`/` fluctuates between ~145Mi and ~4Gi free; five agents share it. `cargo test` and
+`cargo bench` builds fail with ENOSPC mid-link. I deleted only this worktree's
+`target/release` (never `cargo clean`). Do not touch other worktrees' targets.
+Strategy: wait for free space with a background monitor, then build in this order -
+(1) `cargo test -p triplox --lib`, (2) `cargo clippy`, (3) `cargo bench` (release, biggest).
 
 ## Next
 1. Verify pushdown and run-skipping work end to end (skip counters > 0 on weight_filter, rows still 198).
