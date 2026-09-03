@@ -26,9 +26,14 @@ mid-link when it is low; just retry. I deleted only this worktree's `target/rele
 `target/tmp/retry_tests.sh <log> <cmd...>` waits for headroom and retries on ENOSPC.
 
 ## Next
-1. Fold the reversed-order control passes (on_4/5, off_4/5) into EXPERIMENT.md's noise section.
-2. Optional follow-up, not started: build the temporal zone map lazily so head-basis queries
-   stop paying for a map that can never skip anything (see EXPERIMENT.md, "What failed").
+Experiment complete. EXPERIMENT.md at the worktree root has the full write-up. Nothing is
+blocked. If someone picks this up:
+1. Route a value-bounded pattern through AVE as a range scan in the planner. The single
+   pattern `[?e :g/weight ?w] [(> ?w 900)]` is currently executed as 2000 per-entity seeks,
+   so the sorted-scan code at src/query/patterns/triple.rs:259-281 never runs.
+2. Build the temporal zone map lazily (on the first key newer than the basis) so head-basis
+   queries stop paying for a map that can never skip anything. This is what makes
+   label_lookup 100x slower today.
 
 ## Shared context
 
