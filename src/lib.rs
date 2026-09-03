@@ -28,6 +28,8 @@ pub mod schema;
 #[cfg(not(any(test, feature = "test-helpers")))]
 mod schema;
 mod segment;
+#[cfg(test)]
+mod segment_layout_test;
 mod slate;
 mod tempids;
 pub mod tx;

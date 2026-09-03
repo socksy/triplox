@@ -7,10 +7,12 @@ Pack runs of sorted datoms for one attribute into one SlateDB key (keyed by the 
 - Compiles (cargo check --all-targets clean).
 - New: src/segment.rs (format, encode/decode, segmentation rules in module doc), src/iterator/segment_iterator.rs (ScanMode Pair/First, temporal version resolution per logical key).
 - Modified: bootstrap.rs (init_db_with_layout), db_value.rs, indexer.rs (write path), iterator/mod.rs, lib.rs, node.rs, query/patterns/triple.rs, tx.rs (lookup_tx_completion takes a layout).
-- Previous agent was mid-way through applying the node.rs / tx.rs / bootstrap.rs plumbing edits with a script when it stopped. The tree compiles, but verify the layout toggle actually reaches the indexer and the iterators (grep for the layout type) and that the columnar path is exercised at all, not just the row path.
+- Toggle verified plumbed end to end: `SegmentLayout::from_env()` is read in bootstrap, indexer, node, db_value; the query engine picks SegmentIterator in query/patterns/triple.rs:148. Only tx.rs lookup_tx_completion reads AEV/AVE outside the query engine and it is layout-aware.
+- Added src/segment_layout_test.rs: row-vs-columnar equivalence over 9 queries (current + as-of), plus a per-index key/byte/datom-count storage report.
+- NOTE: the machine disk hit 100%. Freed this worktree's target/{debug,release}/incremental. Build with CARGO_INCREMENTAL=0 and keep an eye on `df -h`.
 
 ## Next
-1. Confirm the toggle plumbs end to end; run the bench once with columnar on and check row counts against baseline.
+1. Run the equivalence test (cargo test -p triplox --lib segment_layout -- --nocapture) and record the storage report.
 2. Equivalence test across layouts on a small graph (include an as-of query).
 3. cargo test -p triplox, clippy.
 4. A/B bench; report SlateDB key count and bytes per index before/after and ingest_ms.
