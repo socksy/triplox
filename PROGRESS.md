@@ -82,7 +82,11 @@ enumerating join tuples. Second toggle `TRIPLOX_MATRIX_ALGEBRA=1`, which needs
 - Log line: `TRIPLOX_MATRIX_ALGEBRA_LOG=1` prints the shape, hop count, whether the
   bitset kernels were used, and the answer.
 
+- Statistics pass done: results/stats/stats-sparse-algebra.json (3 arms, 4×5). three_hop_count
+  6771 ms -> 0.88 ms, three_hop_count_distinct 7310 -> 0.11 ms, triangle_count 600 -> 1.06 ms,
+  two_hop_count 238 -> 0.59 ms. Row counts identical across arms.
+- cargo test: 648 passed / 0 failed in all three configurations. Clippy and fmt clean.
+- EXPERIMENT-ALGEBRA.md written.
+
 ## Next
-- Full `cargo test` in all three configurations, clippy, fmt.
-- `stats_run.sh triplox-exp-sparse-matrix sparse-algebra 4 5 off= adj=... algebra=...`
-- Write `EXPERIMENT-ALGEBRA.md`.
+- Done. Possible follow-ups: feed the matrices from the change feed; more shapes.
