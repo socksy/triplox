@@ -1,3 +1,37 @@
+# Deliverable branch: experiments/query-optimizations
+
+## Goal
+One branch holding all the query-optimization experiment code, integrated, building, and
+behind environment toggles. Started from `exp/combo-full` (vectorized join, columnar
+segments, adjacency matrices, matrix algebra) plus the `experiments/` directory; then
+`exp/zone-maps` merged in, and `exp/datom-segments` integrated as a third segment layout.
+
+## Status
+- `experiments/patches` removed.
+- `exp/zone-maps` merged. Conflicts in PROGRESS.md, benches/datalog_bench.rs, src/db_value.rs,
+  src/node.rs, src/query/patterns/triple.rs, src/query/plan.rs, all resolved by keeping both
+  sides. `DB` now carries `zone_maps` next to `layout` and `adjacency`; the planner's
+  `with_value_bounds` is applied to the TriplePattern it already built for the adjacency
+  fallback; the bench keeps QUERY_FILTER and the engine marker as well as ASOF and the zone
+  map counters. `DB::zone_map` returns None unless the layout is `Row`: a zone map summarises
+  runs of raw datom keys, and under either segmented layout the keys under an index prefix
+  are segment keys.
+- `exp/datom-segments` integrated as `SegmentLayout::RowSegments`. `TRIPLOX_SEGMENT_LAYOUT`
+  now takes `row` (default), `row-segments` and `columnar`; `TRIPLOX_SEGMENT_SIZE` sizes the
+  latter two. Its `src/segment.rs` became `src/row_segment.rs` (encode/decode_segment,
+  KeyCursor, write_segmented) so it coexists with the columnar `src/segment.rs`; the
+  layout enum, the Node/Indexer/DB/bootstrap layout plumbing and the write dispatch are
+  shared. Readers went to `KeyCursor`, which is transparent to the row/row-segments shapes;
+  columnar AEV/AVE reads still route to `SegmentIterator`. `write_index_entries_inner` now
+  writes through a `KeySink` with one arm per layout. The CDC tx-eid filter from
+  datom-segments is in `src/slate/cdc.rs`.
+
+## Next
+- Verification: cargo test per configuration, clippy, fmt, row-count equivalence across arms.
+- experiments/README.md update.
+
+---
+
 # Combination experiment: combo-full
 
 > **Follow-on experiment: matrix algebra (`TRIPLOX_MATRIX_ALGEBRA=1`).** See the
