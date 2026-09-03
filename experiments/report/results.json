@@ -1,0 +1,319 @@
+{
+ "vectorized-join": {
+  "triangles": {
+   "off": 748.45,
+   "on": 437.58,
+   "rows": 7821
+  },
+  "two_hop_count": {
+   "off": 294.74,
+   "on": 179.43,
+   "rows": 1
+  },
+  "three_hop_count": {
+   "off": 11837.23,
+   "on": 3294.7,
+   "rows": 1
+  },
+  "out_degree": {
+   "off": 56.78,
+   "on": 63.46,
+   "rows": 2000
+  },
+  "in_degree_top": {
+   "off": 60.74,
+   "on": 57.7,
+   "rows": 2000
+  },
+  "neighbors_of_42": {
+   "off": 2.39,
+   "on": 3.01,
+   "rows": 21
+  },
+  "weight_filter": {
+   "off": 6.32,
+   "on": 5.6,
+   "rows": 198
+  },
+  "weight_sum": {
+   "off": 5.41,
+   "on": 4.6,
+   "rows": 1
+  },
+  "heavy_neighbors": {
+   "off": 80.04,
+   "on": 76.72,
+   "rows": 1908
+  },
+  "label_lookup": {
+   "off": 0.05,
+   "on": 0.07,
+   "rows": 1
+  }
+ },
+ "datom-segments": {
+  "triangles": {
+   "off": 756.33,
+   "on": 614.02,
+   "rows": 7821
+  },
+  "two_hop_count": {
+   "off": 381.5,
+   "on": 270.65,
+   "rows": 1
+  },
+  "three_hop_count": {
+   "off": 18139.48,
+   "on": 20021.9,
+   "rows": 1
+  },
+  "out_degree": {
+   "off": 62.89,
+   "on": 21.04,
+   "rows": 2000
+  },
+  "in_degree_top": {
+   "off": 54.82,
+   "on": 20.66,
+   "rows": 2000
+  },
+  "neighbors_of_42": {
+   "off": 1.85,
+   "on": 0.1,
+   "rows": 21
+  },
+  "weight_filter": {
+   "off": 4.57,
+   "on": 2.13,
+   "rows": 198
+  },
+  "weight_sum": {
+   "off": 4.47,
+   "on": 1.96,
+   "rows": 1
+  },
+  "heavy_neighbors": {
+   "off": 84.01,
+   "on": 47.28,
+   "rows": 1908
+  },
+  "label_lookup": {
+   "off": 0.04,
+   "on": 0.06,
+   "rows": 1
+  }
+ },
+ "columnar-storage": {
+  "triangles": {
+   "off": 652.88,
+   "on": 517.53,
+   "rows": 7821
+  },
+  "two_hop_count": {
+   "off": 265.46,
+   "on": 213.91,
+   "rows": 1
+  },
+  "three_hop_count": {
+   "off": 10512.87,
+   "on": 13113.87,
+   "rows": 1
+  },
+  "out_degree": {
+   "off": 48.55,
+   "on": 15.5,
+   "rows": 2000
+  },
+  "in_degree_top": {
+   "off": 48.35,
+   "on": 16.46,
+   "rows": 2000
+  },
+  "neighbors_of_42": {
+   "off": 1.71,
+   "on": 0.1,
+   "rows": 21
+  },
+  "weight_filter": {
+   "off": 4.08,
+   "on": 1.64,
+   "rows": 198
+  },
+  "weight_sum": {
+   "off": 4.02,
+   "on": 1.69,
+   "rows": 1
+  },
+  "heavy_neighbors": {
+   "off": 72.59,
+   "on": 37.59,
+   "rows": 1908
+  },
+  "label_lookup": {
+   "off": 0.04,
+   "on": 0.03,
+   "rows": 1
+  }
+ },
+ "sparse-matrix": {
+  "triangles": {
+   "off": 797.48,
+   "on": 24.21,
+   "rows": 7821
+  },
+  "two_hop_count": {
+   "off": 323.83,
+   "on": 206.5,
+   "rows": 1
+  },
+  "three_hop_count": {
+   "off": 14747.7,
+   "on": 9157.03,
+   "rows": 1
+  },
+  "out_degree": {
+   "off": 52.27,
+   "on": 6.71,
+   "rows": 2000
+  },
+  "in_degree_top": {
+   "off": 51.99,
+   "on": 6.9,
+   "rows": 2000
+  },
+  "neighbors_of_42": {
+   "off": 1.54,
+   "on": 0.02,
+   "rows": 21
+  },
+  "weight_filter": {
+   "off": 4.43,
+   "on": 3.96,
+   "rows": 198
+  },
+  "weight_sum": {
+   "off": 4.28,
+   "on": 3.91,
+   "rows": 1
+  },
+  "heavy_neighbors": {
+   "off": 81.22,
+   "on": 28.64,
+   "rows": 1908
+  },
+  "label_lookup": {
+   "off": 0.05,
+   "on": 0.03,
+   "rows": 1
+  }
+ },
+ "zone-maps": {
+  "triangles": {
+   "off": 719.27,
+   "on": 611.78,
+   "rows": 7821
+  },
+  "two_hop_count": {
+   "off": 302.33,
+   "on": 274.42,
+   "rows": 1
+  },
+  "three_hop_count": {
+   "off": 12980.84,
+   "on": 9564.31,
+   "rows": 1
+  },
+  "out_degree": {
+   "off": 49.98,
+   "on": 48.15,
+   "rows": 2000
+  },
+  "in_degree_top": {
+   "off": 49.27,
+   "on": 47.76,
+   "rows": 2000
+  },
+  "neighbors_of_42": {
+   "off": 1.69,
+   "on": 1.66,
+   "rows": 21
+  },
+  "weight_filter": {
+   "off": 4.38,
+   "on": 2.67,
+   "rows": 198
+  },
+  "weight_sum": {
+   "off": 4.25,
+   "on": 3.96,
+   "rows": 1
+  },
+  "heavy_neighbors": {
+   "off": 72.28,
+   "on": 70.47,
+   "rows": 1908
+  },
+  "label_lookup": {
+   "off": 0.03,
+   "on": 0.07,
+   "rows": 1
+  },
+  "asof_out_degree": {
+   "off": 23.08,
+   "on": 4.69,
+   "rows": 0
+  },
+  "asof_two_hop_count": {
+   "off": 23.43,
+   "on": 4.99,
+   "rows": 1
+  },
+  "asof_mid_out_degree": {
+   "off": 35.31,
+   "on": 26.87,
+   "rows": 996
+  }
+ },
+ "baseline": {
+  "triangles": {
+   "ms": 537.26,
+   "rows": 7821
+  },
+  "two_hop_count": {
+   "ms": 222.94,
+   "rows": 1
+  },
+  "three_hop_count": {
+   "ms": 7040.8,
+   "rows": 1
+  },
+  "out_degree": {
+   "ms": 44.42,
+   "rows": 2000
+  },
+  "in_degree_top": {
+   "ms": 44.26,
+   "rows": 2000
+  },
+  "neighbors_of_42": {
+   "ms": 1.14,
+   "rows": 21
+  },
+  "weight_filter": {
+   "ms": 3.7,
+   "rows": 198
+  },
+  "weight_sum": {
+   "ms": 3.62,
+   "rows": 1
+  },
+  "heavy_neighbors": {
+   "ms": 67.89,
+   "rows": 1908
+  },
+  "label_lookup": {
+   "ms": 0.02,
+   "rows": 1
+  }
+ }
+}

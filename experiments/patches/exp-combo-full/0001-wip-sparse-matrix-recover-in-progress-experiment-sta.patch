@@ -1,0 +1,1125 @@
+From 8effe2ff0f58234e12e026b0cd295fd1a049b751 Mon Sep 17 00:00:00 2001
+From: Ben Lovell <ben.j.lovell@gmail.com>
+Date: Thu, 3 Sep 2026 19:39:14 +0200
+Subject: [PATCH 01/36] wip(sparse-matrix): recover in-progress experiment
+ state and add PROGRESS.md
+
+---
+ PROGRESS.md                     |  33 +++
+ src/db_value.rs                 |  41 +++
+ src/node.rs                     |  67 +++--
+ src/query.rs                    |   1 +
+ src/query/adjacency.rs          | 286 +++++++++++++++++++++
+ src/query/engine.rs             |  36 +++
+ src/query/exec_pattern.rs       |  10 +
+ src/query/patterns/adjacency.rs | 431 ++++++++++++++++++++++++++++++++
+ src/query/patterns/mod.rs       |   1 +
+ src/query/plan.rs               |  11 +
+ 10 files changed, 895 insertions(+), 22 deletions(-)
+ create mode 100644 PROGRESS.md
+ create mode 100644 src/query/adjacency.rs
+ create mode 100644 src/query/patterns/adjacency.rs
+
+diff --git a/PROGRESS.md b/PROGRESS.md
+new file mode 100644
+index 0000000..ee3e37b
+--- /dev/null
++++ b/PROGRESS.md
+@@ -0,0 +1,33 @@
++# Experiment: sparse adjacency matrices for ref attributes
++
++## Goal
++RedisGraph/GraphBLAS-style: per (ref attribute, basis) build CSR adjacency from one AEV scan, cache on the node, and serve `[?x :ref ?y]` triple patterns from it (row lookups for hops, intersections for triangle closing edge, row nnz for degree) instead of SlateDB iterators. Toggle: env var (check src/query/adjacency.rs for the name actually used). Time-travel queries may fall back.
++
++## Status (as of hand-off)
++- Compiles (cargo check --all-targets clean).
++- New: src/query/adjacency.rs (AdjMatrix, Csr both orientations, cache keyed by basis, build timing), src/query/patterns/adjacency.rs (AdjacencyPattern implementing ExecPattern, same contract as TriplePattern).
++- Modified: db_value.rs, node.rs, query.rs, query/engine.rs, query/exec_pattern.rs, query/patterns/mod.rs, query/plan.rs (planner substitutes AdjacencyPattern for ref-attribute triple patterns when enabled).
++- Previous agent's last note: "the first queries now match; only my not-clause test query is invalid Datalog here. Fixing that query and rerunning." So an on/off equivalence test exists or is half-written and one of its queries uses a not clause that does not parse.
++
++## Next
++1. Find the equivalence test, fix or drop the invalid not-clause query, run it.
++2. cargo test -p triplox, clippy.
++3. A/B bench (3 off / 3 on, alternating), also VERTICES=5000 EDGE_PROB=0.004 once if time allows. Record matrix build time and memory.
++4. EXPERIMENT.md, fmt, commit.
++
++## Shared context
++
++Toolchain: every shell needs `export PATH="$HOME/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin:$PATH"` and `export CARGO_BUILD_JOBS=3`. Never run `cargo clean`. Work only in this worktree.
++
++Benchmark: `cargo bench --bench datalog_bench` (env VERTICES, EDGE_PROB, RUNS, BENCH_OUT). Baseline JSON: /private/tmp/claude-501/-Users-ben-code-triplox/2cc95019-6318-4527-8430-7ad4b12972b9/scratchpad/results/baseline.json. Baseline medians (ms): triangles 537 (7821 rows), two_hop_count 223, three_hop_count 7041, out_degree 44 (2000 rows), in_degree_top 44 (2000 rows), neighbors_of_42 1.1 (21 rows), weight_filter 3.7 (198 rows), weight_sum 3.6, heavy_neighbors 68 (1908 rows), label_lookup 0.02 (1 row).
++
++Definition of done:
++1. Feature behind an env toggle; results identical on/off (row counts match baseline; an on/off equivalence test on a small graph).
++2. `cargo test -p triplox` and `cargo clippy -p triplox --all-targets` pass, or failures are listed here honestly.
++3. A/B interleaved bench, 3 runs each; JSON written to /private/tmp/claude-501/-Users-ben-code-triplox/2cc95019-6318-4527-8430-7ad4b12972b9/scratchpad/results/sparse-matrix-off.json and /private/tmp/claude-501/-Users-ben-code-triplox/2cc95019-6318-4527-8430-7ad4b12972b9/scratchpad/results/sparse-matrix-on.json.
++4. EXPERIMENT.md at worktree root: what was built, hook points (file:line), A/B table, what failed, honest verdict and integration cost.
++5. `cargo fmt`; commit on this branch; do not push; no GitHub issues/PRs.
++
++## Progress protocol
++
++After every milestone (compiles, test passes, bench run, doc written): update the Status and Next sections below, then `git add -A && git commit -q -m "wip(sparse-matrix): <milestone>"`. Commit even if incomplete. This file is the hand-off; a fresh agent must be able to continue from it alone.
+diff --git a/src/db_value.rs b/src/db_value.rs
+index a9226b9..4bf9084 100644
+--- a/src/db_value.rs
++++ b/src/db_value.rs
+@@ -6,6 +6,7 @@ use tokio::runtime::Handle;
+ use crate::indexer::latest_tx_key_from_sdb;
+ use crate::ops::QueryArg;
+ use crate::partition::tx_eid_from_tx_id;
++use crate::query::adjacency::{AdjMatrix, AdjacencyCache};
+ use crate::query::{execute_query, QueryResult};
+ use crate::schema::IdentMap;
+ use triplox_client::node::{Database, IntoQuery};
+@@ -21,6 +22,14 @@ where
+     handle: Handle,
+     tx_key: TxKey,
+     range_stats: Arc<slatedb_estimates::RangeStats<M>>,
++    // Present only when ref-attribute patterns should be served from adjacency matrices.
++    adjacency: Option<Adjacency>,
++}
++
++#[derive(Clone)]
++pub(crate) struct Adjacency {
++    cache: Arc<AdjacencyCache>,
++    ref_attributes: Arc<std::collections::HashSet<i64>>,
+ }
+ 
+ impl<D, M> Clone for DB<D, M>
+@@ -35,6 +44,7 @@ where
+             handle: self.handle.clone(),
+             tx_key: self.tx_key,
+             range_stats: Arc::clone(&self.range_stats),
++            adjacency: self.adjacency.clone(),
+         }
+     }
+ }
+@@ -58,6 +68,36 @@ where
+             handle,
+             tx_key,
+             range_stats,
++            adjacency: None,
++        }
++    }
++
++    /// Serve ref-attribute triple patterns from cached adjacency matrices.
++    pub(crate) fn with_adjacency(
++        mut self,
++        cache: Arc<AdjacencyCache>,
++        ref_attributes: std::collections::HashSet<i64>,
++    ) -> Self {
++        self.adjacency = Some(Adjacency {
++            cache,
++            ref_attributes: Arc::new(ref_attributes),
++        });
++        self
++    }
++
++    pub(crate) fn without_adjacency(mut self) -> Self {
++        self.adjacency = None;
++        self
++    }
++
++    /// The adjacency matrix for `attribute`, or None when it is not a ref attribute or
++    /// matrices are disabled on this DB value.
++    pub(crate) fn adjacency(&self, attribute: i64) -> Result<Option<Arc<AdjMatrix>>, Error> {
++        match &self.adjacency {
++            Some(adjacency) if adjacency.ref_attributes.contains(&attribute) => {
++                adjacency.cache.get_or_build(self, attribute).map(Some)
++            }
++            _ => Ok(None),
+         }
+     }
+ 
+@@ -75,6 +115,7 @@ where
+             handle,
+             tx_key,
+             range_stats,
++            adjacency: None,
+         })
+     }
+ 
+diff --git a/src/node.rs b/src/node.rs
+index 1e3225c..505d27e 100644
+--- a/src/node.rs
++++ b/src/node.rs
+@@ -1,3 +1,4 @@
++use std::collections::HashSet;
+ use std::future::Future;
+ use std::path::{Path, PathBuf};
+ use std::sync::Arc;
+@@ -21,7 +22,8 @@ use crate::kafka_log::KafkaLog;
+ use crate::log::{subscribe, TxLog, TxLogReader, TxLogWriter};
+ use crate::memory_log::MemoryLog;
+ use crate::ops::{QueryArg, TxOp};
+-use crate::schema::Schema;
++use crate::query::adjacency::AdjacencyCache;
++use crate::schema::{IdentMap, Schema, ValueType};
+ use crate::slate::{in_memory_slate, local_slate, remote_slate, SlateComponents};
+ use edn::query::ParsedQuery;
+ use tokio_util::sync::CancellationToken;
+@@ -40,6 +42,12 @@ pub struct Node<L: TxLog> {
+     pub(crate) slate: SlateComponents,
+     subscription: CancellationToken,
+     incremental: IncrementalQueryService,
++    adjacency_cache: Arc<AdjacencyCache>,
++}
++
++/// TRIPLOX_ADJ_MATRIX=1 serves ref-attribute patterns from adjacency matrices.
++pub(crate) fn adjacency_matrix_enabled() -> bool {
++    std::env::var("TRIPLOX_ADJ_MATRIX").is_ok_and(|v| v == "1" || v == "true")
+ }
+ 
+ pub(crate) trait SchemaProvider: Send + Sync + 'static {
+@@ -107,6 +115,7 @@ impl<L: TxLog> Node<L> {
+             slate,
+             subscription,
+             incremental,
++            adjacency_cache: Arc::default(),
+         })
+     }
+ }
+@@ -144,6 +153,7 @@ impl Node<MemoryLog> {
+             slate,
+             subscription,
+             incremental,
++            adjacency_cache: Arc::default(),
+         }
+     }
+ }
+@@ -245,23 +255,46 @@ impl<L: TxLog> Node<L> {
+                 timeout,
+             })??;
+ 
+-        let ident_map = self
+-            .indexer
+-            .read()
+-            .await
+-            .metadata()
+-            .schema
+-            .ident_map
+-            .clone();
++        let (ident_map, ref_attributes) = self.schema_maps().await;
+         let handle = Handle::current();
+         let range_stats = self.slate.range_stats.clone();
+-        Ok(DB::new(
++        let db = DB::new(
+             self.slate.db.clone(),
+             ident_map,
+             handle,
+             tx_key,
+             range_stats,
+-        ))
++        );
++        Ok(self.attach_adjacency(db, ref_attributes, adjacency_matrix_enabled()))
++    }
++
++    async fn schema_maps(&self) -> (IdentMap, HashSet<i64>) {
++        let indexer = self.indexer.read().await;
++        let schema = &indexer.metadata().schema;
++        let ref_attributes = schema
++            .attribute_map
++            .iter()
++            .filter(|(_, attribute)| attribute.value_type == ValueType::Ref)
++            .map(|(id, _)| *id)
++            .collect();
++        (schema.ident_map.clone(), ref_attributes)
++    }
++
++    fn attach_adjacency(&self, db: DB, ref_attributes: HashSet<i64>, enabled: bool) -> DB {
++        if enabled {
++            db.with_adjacency(Arc::clone(&self.adjacency_cache), ref_attributes)
++        } else {
++            db
++        }
++    }
++
++    /// Latest DB with adjacency matrices explicitly on or off, regardless of the env toggle.
++    pub(crate) async fn db_with_adjacency(&self, enabled: bool) -> Result<DB, Error> {
++        let (ident_map, ref_attributes) = self.schema_maps().await;
++        let handle = Handle::current();
++        let range_stats = self.slate.range_stats.clone();
++        let db = DB::from_latest_sdb(self.slate.db.clone(), ident_map, handle, range_stats).await?;
++        Ok(self.attach_adjacency(db, ref_attributes, enabled))
+     }
+ 
+     pub(crate) async fn register_incremental_query(
+@@ -321,17 +354,7 @@ impl<L: TxLog> QueryNode for Node<L> {
+     type DB = DB;
+ 
+     async fn db(&self) -> Result<DB, Error> {
+-        let ident_map = self
+-            .indexer
+-            .read()
+-            .await
+-            .metadata()
+-            .schema
+-            .ident_map
+-            .clone();
+-        let handle = Handle::current();
+-        let range_stats = self.slate.range_stats.clone();
+-        DB::from_latest_sdb(self.slate.db.clone(), ident_map, handle, range_stats).await
++        self.db_with_adjacency(adjacency_matrix_enabled()).await
+     }
+ 
+     async fn db_as_of(&self, tx_key: TxKey) -> Result<DB, Error> {
+diff --git a/src/query.rs b/src/query.rs
+index e392c4e..e465981 100644
+--- a/src/query.rs
++++ b/src/query.rs
+@@ -1,5 +1,6 @@
+ #![allow(unused)]
+ 
++pub(crate) mod adjacency;
+ pub(crate) mod binding_bag;
+ pub(crate) mod engine;
+ pub(crate) mod exec_pattern;
+diff --git a/src/query/adjacency.rs b/src/query/adjacency.rs
+new file mode 100644
+index 0000000..fed29f7
+--- /dev/null
++++ b/src/query/adjacency.rs
+@@ -0,0 +1,286 @@
++//! Sparse adjacency matrices for ref attributes. One matrix per (attribute, basis),
++//! built from a single AEV scan and cached on the node. Both orientations are kept
++//! as CSR so row lookups work from either the entity or the value side.
++
++use std::collections::HashMap;
++use std::sync::{Arc, Mutex};
++use std::time::Instant;
++
++use anyhow::{bail, Result};
++use bytes::Bytes;
++use slatedb::{DbMetadataOps, DbReadOps};
++
++use crate::codec::{self, decode_datatype, encode_datatype};
++use crate::db_value::DB;
++use crate::index::IndexType;
++use crate::iterator::slate_iterator::{Extractor, Index};
++use crate::iterator::temporal_filter_iterator::TemporalFilterIterator;
++use crate::ops::DataType;
++
++pub(crate) fn encode_entity(id: i64) -> Bytes {
++    let mut buf = Vec::with_capacity(codec::ENTITY_LENGTH);
++    encode_datatype(&DataType::Long(id), &mut buf);
++    Bytes::from(buf)
++}
++
++pub(crate) fn decode_entity(bytes: &[u8]) -> Option<i64> {
++    let mut cursor = bytes;
++    match decode_datatype(&mut cursor) {
++        Ok(DataType::Long(id)) if cursor.is_empty() => Some(id),
++        _ => None,
++    }
++}
++
++/// Compressed sparse rows keyed by a sorted list of row ids.
++pub(crate) struct Csr {
++    keys: Vec<i64>,
++    offsets: Vec<usize>,
++    cols: Vec<i64>,
++    // Every column id pre-encoded as a 9-byte entity so extensions are zero-copy slices.
++    cols_enc: Bytes,
++    keys_enc: Bytes,
++}
++
++impl Csr {
++    // `pairs` must be sorted by (key, col) and free of duplicates.
++    fn from_sorted_pairs(pairs: &[(i64, i64)]) -> Self {
++        let mut keys = Vec::new();
++        let mut offsets = vec![0];
++        let mut cols = Vec::with_capacity(pairs.len());
++        let mut cols_enc = Vec::with_capacity(pairs.len() * codec::ENTITY_LENGTH);
++        for (key, col) in pairs {
++            if keys.last() != Some(key) {
++                keys.push(*key);
++                offsets.push(cols.len());
++            }
++            cols.push(*col);
++            encode_datatype(&DataType::Long(*col), &mut cols_enc);
++            *offsets.last_mut().unwrap() = cols.len();
++        }
++        let mut keys_enc = Vec::with_capacity(keys.len() * codec::ENTITY_LENGTH);
++        for key in &keys {
++            encode_datatype(&DataType::Long(*key), &mut keys_enc);
++        }
++        Self {
++            keys,
++            offsets,
++            cols,
++            cols_enc: Bytes::from(cols_enc),
++            keys_enc: Bytes::from(keys_enc),
++        }
++    }
++
++    fn row_range(&self, key: i64) -> Option<std::ops::Range<usize>> {
++        let index = self.keys.binary_search(&key).ok()?;
++        Some(self.offsets[index]..self.offsets[index + 1])
++    }
++
++    pub(crate) fn keys(&self) -> &[i64] {
++        &self.keys
++    }
++
++    pub(crate) fn has_key(&self, key: i64) -> bool {
++        self.keys.binary_search(&key).is_ok()
++    }
++
++    pub(crate) fn row(&self, key: i64) -> &[i64] {
++        self.row_range(key)
++            .map(|range| &self.cols[range])
++            .unwrap_or(&[])
++    }
++
++    pub(crate) fn contains(&self, key: i64, col: i64) -> bool {
++        self.row(key).binary_search(&col).is_ok()
++    }
++
++    pub(crate) fn nnz(&self, key: i64) -> usize {
++        self.row(key).len()
++    }
++
++    /// Encoded column ids of one row, sliced from the shared buffer.
++    pub(crate) fn row_encoded(&self, key: i64) -> Vec<Bytes> {
++        self.row_range(key)
++            .map(|range| {
++                range
++                    .map(|i| {
++                        self.cols_enc
++                            .slice(i * codec::ENTITY_LENGTH..(i + 1) * codec::ENTITY_LENGTH)
++                    })
++                    .collect()
++            })
++            .unwrap_or_default()
++    }
++
++    pub(crate) fn keys_encoded(&self) -> Vec<Bytes> {
++        (0..self.keys.len())
++            .map(|i| {
++                self.keys_enc
++                    .slice(i * codec::ENTITY_LENGTH..(i + 1) * codec::ENTITY_LENGTH)
++            })
++            .collect()
++    }
++
++    fn bytes(&self) -> usize {
++        self.keys.len() * 8
++            + self.offsets.len() * 8
++            + self.cols.len() * 8
++            + self.cols_enc.len()
++            + self.keys_enc.len()
++    }
++}
++
++pub(crate) struct AdjMatrix {
++    // entity -> values
++    pub(crate) out: Csr,
++    // value -> entities
++    pub(crate) inn: Csr,
++    pub(crate) nnz: usize,
++    pub(crate) build_time: std::time::Duration,
++}
++
++impl AdjMatrix {
++    pub(crate) fn bytes(&self) -> usize {
++        self.out.bytes() + self.inn.bytes()
++    }
++
++    /// Scan the AEV index for `attribute` as of the DB basis and build both orientations.
++    pub(crate) fn build<D, M>(db: &DB<D, M>, attribute: i64) -> Result<Self>
++    where
++        D: DbReadOps + Send + Sync + 'static,
++        M: DbMetadataOps + Send + Sync + 'static,
++    {
++        let start = Instant::now();
++        let mut prefix = vec![codec::index_type_to_prefix(IndexType::AEV)?];
++        codec::encode_i64(attribute, &mut prefix);
++        let prefix_len = prefix.len();
++        let extractor: Extractor =
++            Box::new(move |key| key.slice(prefix_len..key.len() - codec::TX_EID_OP_SUFFIX));
++        let mut iterator = TemporalFilterIterator::new(
++            &prefix,
++            db.sdb(),
++            db.handle().clone(),
++            extractor,
++            db.as_of(),
++            Arc::clone(db.range_stats()),
++        )?;
++
++        let mut pairs = Vec::new();
++        while let Some(ev) = iterator.get_value()? {
++            if ev.len() != 2 * codec::ENTITY_LENGTH {
++                bail!("attribute {attribute} has a non-entity value, not a ref attribute");
++            }
++            let (entity, value) = (
++                decode_entity(&ev[..codec::ENTITY_LENGTH]),
++                decode_entity(&ev[codec::ENTITY_LENGTH..]),
++            );
++            let (Some(entity), Some(value)) = (entity, value) else {
++                bail!("attribute {attribute} has a non-entity value, not a ref attribute");
++            };
++            pairs.push((entity, value));
++            iterator.next()?;
++        }
++        // The key encoding does not sort like i64, so both orientations are re-sorted.
++        pairs.sort_unstable();
++        let out = Csr::from_sorted_pairs(&pairs);
++        let mut transposed: Vec<(i64, i64)> = pairs.iter().map(|(e, v)| (*v, *e)).collect();
++        transposed.sort_unstable();
++        let inn = Csr::from_sorted_pairs(&transposed);
++        Ok(Self {
++            out,
++            inn,
++            nnz: pairs.len(),
++            build_time: start.elapsed(),
++        })
++    }
++}
++
++/// Matrices keyed by (attribute, tx_id). Shared across DB values of one node.
++#[derive(Default)]
++pub(crate) struct AdjacencyCache {
++    matrices: Mutex<HashMap<(i64, i64), Arc<AdjMatrix>>>,
++}
++
++impl AdjacencyCache {
++    pub(crate) fn get_or_build<D, M>(&self, db: &DB<D, M>, attribute: i64) -> Result<Arc<AdjMatrix>>
++    where
++        D: DbReadOps + Send + Sync + 'static,
++        M: DbMetadataOps + Send + Sync + 'static,
++    {
++        let key = (attribute, db.tx_key().tx_id);
++        if let Some(matrix) = self.matrices.lock().unwrap().get(&key) {
++            return Ok(Arc::clone(matrix));
++        }
++        let matrix = Arc::new(AdjMatrix::build(db, attribute)?);
++        if std::env::var_os("TRIPLOX_ADJ_MATRIX_LOG").is_some() {
++            eprintln!(
++                "adjacency matrix attr={attribute} tx={} nnz={} rows_out={} rows_in={} bytes={} build_ms={:.2}",
++                key.1,
++                matrix.nnz,
++                matrix.out.keys().len(),
++                matrix.inn.keys().len(),
++                matrix.bytes(),
++                matrix.build_time.as_secs_f64() * 1000.0
++            );
++        }
++        self.matrices
++            .lock()
++            .unwrap()
++            .insert(key, Arc::clone(&matrix));
++        Ok(matrix)
++    }
++}
++
++/// Sorted-slice intersection of every set in `sets`.
++pub(crate) fn intersect_sorted(sets: &[&[i64]]) -> Vec<i64> {
++    let Some((first, rest)) = sets.split_first() else {
++        return Vec::new();
++    };
++    let mut current: Vec<i64> = first.to_vec();
++    for other in rest {
++        let (mut i, mut j) = (0, 0);
++        let mut next = Vec::with_capacity(current.len().min(other.len()));
++        while i < current.len() && j < other.len() {
++            match current[i].cmp(&other[j]) {
++                std::cmp::Ordering::Less => i += 1,
++                std::cmp::Ordering::Greater => j += 1,
++                std::cmp::Ordering::Equal => {
++                    next.push(current[i]);
++                    i += 1;
++                    j += 1;
++                }
++            }
++        }
++        current = next;
++    }
++    current
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn csr_rows_and_membership() {
++        let csr = Csr::from_sorted_pairs(&[(1, 2), (1, 5), (3, 1)]);
++        assert_eq!(csr.keys(), &[1, 3]);
++        assert_eq!(csr.row(1), &[2, 5]);
++        assert_eq!(csr.row(3), &[1]);
++        assert!(csr.row(2).is_empty());
++        assert!(csr.contains(1, 5));
++        assert!(!csr.contains(1, 3));
++        assert_eq!(csr.nnz(1), 2);
++        assert_eq!(csr.row_encoded(1), vec![encode_entity(2), encode_entity(5)]);
++        assert_eq!(csr.keys_encoded(), vec![encode_entity(1), encode_entity(3)]);
++        assert_eq!(decode_entity(&encode_entity(-7)), Some(-7));
++    }
++
++    #[test]
++    fn intersects_sorted_sets() {
++        assert_eq!(
++            intersect_sorted(&[&[1, 2, 3, 5], &[2, 3, 4], &[3, 5]]),
++            vec![3]
++        );
++        assert!(intersect_sorted(&[]).is_empty());
++        assert_eq!(intersect_sorted(&[&[1, 2]]), vec![1, 2]);
++    }
++}
+diff --git a/src/query/engine.rs b/src/query/engine.rs
+index ff37c90..79af2aa 100644
+--- a/src/query/engine.rs
++++ b/src/query/engine.rs
+@@ -2,6 +2,7 @@ use std::collections::HashMap;
+ 
+ use anyhow::{ensure, Context, Result};
+ 
++use super::adjacency::{encode_entity, intersect_sorted};
+ use super::binding_bag::BindingBag;
+ use super::exec_pattern::{ExecPattern, PatternId, Proposal};
+ use super::stage::Stage;
+@@ -48,7 +49,42 @@ impl GenericJoinEngine {
+         Ok(())
+     }
+ 
++    // Intersects the candidate sets of every proposer when all of them can supply one.
++    fn execute_intersecting_stage(stage: &Stage, input: &BindingBag) -> Result<Option<BindingBag>> {
++        let mut per_proposer = Vec::with_capacity(stage.proposers().len());
++        for proposer in stage.proposers() {
++            match proposer.candidate_sets(input, stage.added())? {
++                Some(sets) => per_proposer.push(sets),
++                None => return Ok(None),
++            }
++        }
++        let extensions = (0..input.rows.len())
++            .map(|row_index| {
++                let sets: Vec<&[i64]> = per_proposer.iter().map(|sets| sets[row_index]).collect();
++                intersect_sorted(&sets)
++                    .into_iter()
++                    .map(|id| vec![encode_entity(id)])
++                    .collect()
++            })
++            .collect();
++        let proposed = input
++            .extend_rows(stage.added().to_vec(), extensions)?
++            .reorder(stage.target_variables())?;
++        let proposer_ids: Vec<PatternId> = stage.proposers().map(|p| p.id()).collect();
++        let validators = stage
++            .participants()
++            .iter()
++            .filter(|participant| !proposer_ids.contains(&participant.id()))
++            .map(|participant| participant.as_ref());
++        Self::validate_all(proposed, validators).map(Some)
++    }
++
+     fn execute_proposing_stage(stage: &Stage, input: &BindingBag) -> Result<BindingBag> {
++        if stage.proposers().len() > 1 && stage.added().len() == 1 {
++            if let Some(result) = Self::execute_intersecting_stage(stage, input)? {
++                return Ok(result);
++            }
++        }
+         if stage.proposers().len() == 1 {
+             let proposer = stage
+                 .proposers()
+diff --git a/src/query/exec_pattern.rs b/src/query/exec_pattern.rs
+index 88be6dd..6d7fd26 100644
+--- a/src/query/exec_pattern.rs
++++ b/src/query/exec_pattern.rs
+@@ -57,6 +57,16 @@ pub(crate) trait ExecPattern: Send + Sync {
+         bail!("Pattern {} cannot propose", self.id())
+     }
+ 
++    // Sorted entity-id candidates per input row for `added`, when available without IO.
++    // Lets the engine intersect several proposers instead of proposing then validating.
++    fn candidate_sets<'a>(
++        &'a self,
++        _input: &BindingBag,
++        _added: &[Variable],
++    ) -> Result<Option<Vec<&'a [i64]>>> {
++        Ok(None)
++    }
++
+     // Extends the `input`` when `added` is non-empty; otherwise filters `input` without changing its layout.
+     /// An empty `added` existentially validates the current `input` binding prefix; unbound pattern variables remain for later stages.
+     fn join(
+diff --git a/src/query/patterns/adjacency.rs b/src/query/patterns/adjacency.rs
+new file mode 100644
+index 0000000..2ebd242
+--- /dev/null
++++ b/src/query/patterns/adjacency.rs
+@@ -0,0 +1,431 @@
++//! Triple pattern over a ref attribute served from an in-memory adjacency matrix
++//! instead of SlateDB iterators. Same contract as `TriplePattern`.
++
++use std::sync::Arc;
++
++use anyhow::{ensure, Result};
++use edn::query::Variable;
++
++use crate::query::adjacency::{decode_entity, AdjMatrix, Csr};
++use crate::query::binding_bag::{BindingBag, BindingRow};
++use crate::query::exec_pattern::{ExecPattern, PatternId, Proposal};
++use crate::query::patterns::triple::TripleTerm;
++
++#[derive(Clone, Copy)]
++enum Position {
++    Entity,
++    Value,
++}
++
++pub(crate) struct AdjacencyPattern {
++    id: PatternId,
++    variables: Vec<Variable>,
++    entity: TripleTerm,
++    value: TripleTerm,
++    matrix: Arc<AdjMatrix>,
++}
++
++impl AdjacencyPattern {
++    /// Returns None when a constant term is not an entity id, so the caller can fall back.
++    pub(crate) fn new(
++        id: PatternId,
++        entity: TripleTerm,
++        value: TripleTerm,
++        matrix: Arc<AdjMatrix>,
++    ) -> Result<Option<Self>> {
++        for term in [&entity, &value] {
++            if let TripleTerm::Constant(constant) = term {
++                if decode_entity(constant).is_none() {
++                    return Ok(None);
++                }
++            }
++        }
++        let mut variables = Vec::new();
++        for term in [&entity, &value] {
++            if let TripleTerm::Variable(variable) = term {
++                ensure!(
++                    !variables.contains(variable),
++                    "Triple pattern {id} repeats variable {variable}"
++                );
++                variables.push(variable.clone());
++            }
++        }
++        Ok(Some(Self {
++            id,
++            variables,
++            entity,
++            value,
++            matrix,
++        }))
++    }
++
++    fn position_for_variable(&self, variable: &Variable) -> Option<Position> {
++        match (&self.entity, &self.value) {
++            (TripleTerm::Variable(v), _) if v == variable => Some(Position::Entity),
++            (_, TripleTerm::Variable(v)) if v == variable => Some(Position::Value),
++            _ => None,
++        }
++    }
++
++    // The CSR whose rows are keyed by the term opposite to `position`.
++    fn csr_for(&self, position: Position) -> &Csr {
++        match position {
++            Position::Entity => &self.matrix.inn,
++            Position::Value => &self.matrix.out,
++        }
++    }
++
++    // The CSR whose keys are every id occurring at `position`.
++    fn keys_for(&self, position: Position) -> &Csr {
++        match position {
++            Position::Entity => &self.matrix.out,
++            Position::Value => &self.matrix.inn,
++        }
++    }
++
++    fn other_term(&self, position: Position) -> &TripleTerm {
++        match position {
++            Position::Entity => &self.value,
++            Position::Value => &self.entity,
++        }
++    }
++
++    /// Per input row: the CSR row for the proposed position, the full key list when the
++    /// other side is unbound, or nothing when the other side is not an entity id.
++    fn row_keys(&self, input: &BindingBag, position: Position) -> Result<Vec<RowKey>> {
++        Ok(match self.other_term(position) {
++            TripleTerm::Variable(other) if input.column_indexes.contains_key(other) => {
++                let index = input.column_index(other)?;
++                input
++                    .rows
++                    .iter()
++                    .map(|row| decode_entity(&row[index]).map_or(RowKey::Missing, RowKey::Key))
++                    .collect()
++            }
++            TripleTerm::Variable(_) => vec![RowKey::All; input.rows.len()],
++            TripleTerm::Constant(constant) => {
++                let key = decode_entity(constant).map_or(RowKey::Missing, RowKey::Key);
++                vec![key; input.rows.len()]
++            }
++        })
++    }
++
++    fn validate(&self, input: &BindingBag) -> Result<BindingBag> {
++        let bound = |term: &TripleTerm| match term {
++            TripleTerm::Variable(variable) => input
++                .column_indexes
++                .get(variable)
++                .map(|index| Bound::Column(*index)),
++            TripleTerm::Constant(constant) => Some(Bound::Constant(decode_entity(constant))),
++        };
++        let (entity, value) = (bound(&self.entity), bound(&self.value));
++        ensure!(
++            entity.is_some() || value.is_some(),
++            "Triple pattern {} has no bound variables to validate",
++            self.id
++        );
++        let mut matched = Vec::new();
++        for (row_index, row) in input.rows.iter().enumerate() {
++            let ok = match (entity, value) {
++                (Some(entity), Some(value)) => match (entity.resolve(row), value.resolve(row)) {
++                    (Some(entity), Some(value)) => self.matrix.out.contains(entity, value),
++                    _ => false,
++                },
++                (Some(entity), None) => entity
++                    .resolve(row)
++                    .is_some_and(|e| self.matrix.out.has_key(e)),
++                (None, Some(value)) => value
++                    .resolve(row)
++                    .is_some_and(|v| self.matrix.inn.has_key(v)),
++                (None, None) => unreachable!(),
++            };
++            if ok {
++                matched.push(row_index);
++            }
++        }
++        input.select_rows(&matched)
++    }
++
++    fn propose(&self, input: &BindingBag, added: &[Variable]) -> Result<BindingBag> {
++        let position = self.proposed_position(input, added)?;
++        let csr = self.csr_for(position);
++        let extensions: Vec<Vec<BindingRow>> = self
++            .row_keys(input, position)?
++            .into_iter()
++            .map(|key| {
++                let values = match key {
++                    RowKey::Key(key) => csr.row_encoded(key),
++                    RowKey::All => self.keys_for(position).keys_encoded(),
++                    RowKey::Missing => Vec::new(),
++                };
++                values.into_iter().map(|value| vec![value]).collect()
++            })
++            .collect();
++        input.extend_rows(added.to_vec(), extensions)
++    }
++
++    fn proposed_position(&self, input: &BindingBag, added: &[Variable]) -> Result<Position> {
++        ensure!(
++            added.len() == 1,
++            "Triple pattern {} can propose exactly one variable, got {added:?}",
++            self.id
++        );
++        ensure!(
++            !input.variables.contains(&added[0]),
++            "Triple pattern {} cannot add already-bound variable {}",
++            self.id,
++            added[0]
++        );
++        self.position_for_variable(&added[0]).ok_or_else(|| {
++            anyhow::anyhow!(
++                "Triple pattern {} cannot propose variable {}",
++                self.id,
++                added[0]
++            )
++        })
++    }
++}
++
++#[derive(Clone, Copy)]
++enum RowKey {
++    All,
++    Key(i64),
++    Missing,
++}
++
++#[derive(Clone, Copy)]
++enum Bound {
++    Column(usize),
++    Constant(Option<i64>),
++}
++
++impl Bound {
++    fn resolve(self, row: &BindingRow) -> Option<i64> {
++        match self {
++            Self::Column(index) => decode_entity(&row[index]),
++            Self::Constant(id) => id,
++        }
++    }
++}
++
++impl ExecPattern for AdjacencyPattern {
++    fn id(&self) -> PatternId {
++        self.id
++    }
++
++    fn variables(&self) -> &[Variable] {
++        &self.variables
++    }
++
++    fn count(
++        &self,
++        input: &BindingBag,
++        added: &[Variable],
++        proposals: &mut [Proposal],
++    ) -> Result<()> {
++        ensure!(
++            proposals.len() == input.rows.len(),
++            "Triple pattern {} received {} proposals for {} input rows",
++            self.id,
++            proposals.len(),
++            input.rows.len()
++        );
++        if input.rows.is_empty() {
++            return Ok(());
++        }
++        let position = self.proposed_position(input, added)?;
++        let csr = self.csr_for(position);
++        for (key, proposal) in self.row_keys(input, position)?.into_iter().zip(proposals) {
++            let count = match key {
++                RowKey::Key(key) => csr.nnz(key),
++                RowKey::All => self.keys_for(position).keys().len(),
++                RowKey::Missing => 0,
++            };
++            proposal.consider(self.id, count);
++        }
++        Ok(())
++    }
++
++    fn candidate_sets<'a>(
++        &'a self,
++        input: &BindingBag,
++        added: &[Variable],
++    ) -> Result<Option<Vec<&'a [i64]>>> {
++        let position = self.proposed_position(input, added)?;
++        let csr = self.csr_for(position);
++        let sets = self
++            .row_keys(input, position)?
++            .into_iter()
++            .map(|key| match key {
++                RowKey::Key(key) => csr.row(key),
++                RowKey::All => self.keys_for(position).keys(),
++                RowKey::Missing => &[][..],
++            })
++            .collect();
++        Ok(Some(sets))
++    }
++
++    fn join(
++        &self,
++        input: &BindingBag,
++        added: &[Variable],
++        target_variables: &[Variable],
++    ) -> Result<BindingBag> {
++        if added.is_empty() {
++            let res = self.validate(input)?;
++            ensure!(
++                target_variables == res.variables,
++                "Triple pattern target_layout {:?} doesn't match the computed layout {:?}",
++                target_variables,
++                res.variables
++            );
++            Ok(res)
++        } else {
++            self.propose(input, added)?.reorder(target_variables)
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use edn::kw;
++    use edn::Keyword;
++
++    use crate::ops::{DataType, EntityRef, TxOp};
++    use crate::{Database, Node, QueryNode, SubmitNode, TransactionResult};
++
++    fn schema_attr(ident: Keyword, value_type: &str, cardinality: &str) -> TxOp {
++        TxOp::put([
++            (kw!(:db/ident), DataType::Keyword(ident)),
++            (
++                kw!(:db/valueType),
++                DataType::Keyword(Keyword::namespaced("db.type", value_type)),
++            ),
++            (
++                kw!(:db/cardinality),
++                DataType::Keyword(Keyword::namespaced("db.cardinality", cardinality)),
++            ),
++        ])
++    }
++
++    async fn commit(node: &Node<crate::memory_log::MemoryLog>, ops: Vec<TxOp>) {
++        match node.execute_tx(ops).await.unwrap() {
++            TransactionResult::TxCommitted(_) => {}
++            TransactionResult::TxAborted(_, err) => panic!("tx aborted: {err}"),
++        }
++    }
++
++    // Deterministic small graph: edge i -> j when (i * 7 + j * 13) % 5 == 0, plus a retraction.
++    async fn graph_node() -> Node<crate::memory_log::MemoryLog> {
++        let node = Node::memory_node().await;
++        commit(
++            &node,
++            vec![
++                schema_attr(kw!(:g/id), "long", "one"),
++                schema_attr(kw!(:g/to), "ref", "many"),
++                schema_attr(kw!(:g/weight), "long", "one"),
++            ],
++        )
++        .await;
++        let n = 40i64;
++        commit(
++            &node,
++            (0..n)
++                .map(|i| {
++                    TxOp::put([
++                        (kw!(:g/id), DataType::Long(i)),
++                        (kw!(:g/weight), DataType::Long(i * 37 % 100)),
++                    ])
++                })
++                .collect(),
++        )
++        .await;
++        let rows = node
++            .db()
++            .await
++            .unwrap()
++            .query("[:find ?id ?e :where [?e :g/id ?id]]")
++            .await
++            .unwrap();
++        let mut eid = vec![0i64; n as usize];
++        for row in rows {
++            let [DataType::Long(id), DataType::Long(e)] = row.as_slice() else {
++                panic!("unexpected row {row:?}");
++            };
++            eid[*id as usize] = *e;
++        }
++        let mut edges = Vec::new();
++        for i in 0..n {
++            for j in 0..n {
++                if i != j && (i * 7 + j * 13) % 5 == 0 {
++                    edges.push(TxOp::Add {
++                        entity: EntityRef::Id(eid[i as usize]),
++                        attribute: kw!(:g/to),
++                        value: DataType::Long(eid[j as usize]),
++                    });
++                }
++            }
++        }
++        commit(&node, edges).await;
++        // A retracted edge must disappear from the matrix too.
++        commit(
++            &node,
++            vec![TxOp::Retract {
++                entity: EntityRef::Id(eid[0]),
++                attribute: kw!(:g/to),
++                value: DataType::Long(eid[5]),
++            }],
++        )
++        .await;
++        node
++    }
++
++    fn sorted(rows: Vec<Vec<DataType>>) -> Vec<String> {
++        let mut rows: Vec<String> = rows.into_iter().map(|row| format!("{row:?}")).collect();
++        rows.sort();
++        rows
++    }
++
++    const QUERIES: &[&str] = &[
++        "[:find ?a ?b :where [?a :g/to ?b]]",
++        "[:find ?a ?b ?c :where [?a :g/to ?b] [?b :g/to ?c] [?a :g/to ?c]]",
++        "[:find ?a ?c :where [?a :g/to ?b] [?b :g/to ?c]]",
++        "[:find (count ?c) :where [?a :g/to ?b] [?b :g/to ?c]]",
++        "[:find ?a (count ?b) :where [?a :g/to ?b]]",
++        "[:find ?b (count ?a) :where [?a :g/to ?b]]",
++        "[:find ?b :where [?a :g/id 3] [?a :g/to ?b]]",
++        "[:find ?a :where [?b :g/id 3] [?a :g/to ?b]]",
++        "[:find ?a ?b :where [?a :g/to ?b] [?b :g/weight ?w] [(> ?w 50)]]",
++        "[:find ?a :where [?a :g/id ?i] [?b :g/id 3] (not [?a :g/to ?b])]",
++        "[:find ?a ?w :where [?a :g/weight ?w] [?a :g/to ?a]]",
++    ];
++
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn adjacency_path_matches_iterator_path() {
++        let node = graph_node().await;
++        let on = node.db_with_adjacency(true).await.unwrap();
++        let off = node.db_with_adjacency(false).await.unwrap();
++        for query in QUERIES {
++            let expected = off.query(*query).await.unwrap();
++            let actual = on.query(*query).await.unwrap();
++            assert!(!expected.is_empty(), "{query} returned nothing");
++            assert_eq!(sorted(actual), sorted(expected), "{query}");
++        }
++
++        // Matrices are built inside the blocking query task, so by now this is a cache hit.
++        let to = on.ident_map()[&kw!(:g/to)];
++        let id = on.ident_map()[&kw!(:g/id)];
++        assert!(on.adjacency(id).unwrap().is_none());
++        assert!(off.adjacency(to).unwrap().is_none());
++        let matrix = on.adjacency(to).unwrap().unwrap();
++        let rows = on
++            .query("[:find ?a ?b :where [?a :g/id 0] [?b :g/id 5]]")
++            .await
++            .unwrap();
++        let [DataType::Long(a), DataType::Long(b)] = rows[0].as_slice() else {
++            panic!("unexpected row");
++        };
++        assert!(!matrix.out.contains(*a, *b));
++        node.close().await.unwrap();
++    }
++}
+diff --git a/src/query/patterns/mod.rs b/src/query/patterns/mod.rs
+index 3e897e6..f696fbe 100644
+--- a/src/query/patterns/mod.rs
++++ b/src/query/patterns/mod.rs
+@@ -5,6 +5,7 @@ use edn::query::Variable;
+ 
+ mod evaluation;
+ 
++pub(crate) mod adjacency;
+ pub(crate) mod function;
+ pub(crate) mod not;
+ pub(crate) mod or;
+diff --git a/src/query/plan.rs b/src/query/plan.rs
+index 6f70e03..6ea10db 100644
+--- a/src/query/plan.rs
++++ b/src/query/plan.rs
+@@ -20,6 +20,7 @@ use crate::query::{
+ 
+ use super::binding_bag::BindingBag;
+ use super::exec_pattern::{ExecPattern, PatternId};
++use super::patterns::adjacency::AdjacencyPattern;
+ use super::patterns::function::FunctionPattern;
+ use super::patterns::not::NotPattern;
+ use super::patterns::or::OrPattern;
+@@ -374,6 +375,16 @@ impl LogicalDescriptor {
+             LogicalDescriptorKind::Triple(pattern) => {
+                 let attribute = resolve_attribute_from_pattern(&pattern.attribute, db.ident_map())
+                     .with_context(|| format!("Failed to resolve triple pattern {}", self.id))?;
++                if let Some(matrix) = db.adjacency(attribute)? {
++                    if let Some(adjacency) = AdjacencyPattern::new(
++                        self.id,
++                        entity_term(&pattern.entity)?,
++                        value_term(&pattern.value)?,
++                        matrix,
++                    )? {
++                        return Ok(Arc::new(adjacency));
++                    }
++                }
+                 Ok(Arc::new(TriplePattern::new(
+                     self.id,
+                     entity_term(&pattern.entity)?,
+-- 
+2.51.2
+

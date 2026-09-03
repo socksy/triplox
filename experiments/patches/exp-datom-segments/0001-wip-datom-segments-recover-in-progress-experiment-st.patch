@@ -1,0 +1,1444 @@
+From 4a76ad0f71110324c0192fdcc2a5d81170726fcb Mon Sep 17 00:00:00 2001
+From: Ben Lovell <ben.j.lovell@gmail.com>
+Date: Thu, 3 Sep 2026 19:39:14 +0200
+Subject: [PATCH 1/7] wip(datom-segments): recover in-progress experiment state
+ and add PROGRESS.md
+
+---
+ PROGRESS.md                              |  34 ++
+ benches/datalog_bench.rs                 |  26 +-
+ src/bootstrap.rs                         |  21 +-
+ src/incremental/cdc.rs                   |  13 +-
+ src/indexer.rs                           |  84 ++-
+ src/iterator/slate_iterator.rs           |  26 +-
+ src/iterator/slate_key_iterator.rs       |  16 +-
+ src/iterator/temporal_filter_iterator.rs |  19 +-
+ src/lib.rs                               |   5 +-
+ src/node.rs                              |  52 ++
+ src/query/patterns/triple.rs             |   3 +-
+ src/segment.rs                           | 682 +++++++++++++++++++++++
+ src/tempids.rs                           |   4 +-
+ src/tx.rs                                |  18 +-
+ 14 files changed, 918 insertions(+), 85 deletions(-)
+ create mode 100644 PROGRESS.md
+ create mode 100644 src/segment.rs
+
+diff --git a/PROGRESS.md b/PROGRESS.md
+new file mode 100644
+index 0000000..8278c85
+--- /dev/null
++++ b/PROGRESS.md
+@@ -0,0 +1,34 @@
++# Experiment: multiple datoms per SlateDB key (row-major segments)
++
++## Goal
++Datomic-style segments: up to N sorted datom keys under one key (keyed by the last datom key), per-datom encoding unchanged. Isolate the effect of key count / per-key LSM overhead. Toggle: TRIPLOX_SEGMENT_SIZE (1 = today's layout; measure 64, 256, 1024). Readers accept both layouts in one index. Point lookups, lookup refs, temporal filtering, CDC must keep working.
++
++## Status (as of hand-off)
++- Compiles (cargo check --all-targets clean). Previous agent reported "Build passes" after porting the three iterators onto a segment cursor.
++- New: src/segment.rs (layout, configured_segment_size, cursor, write helpers).
++- Modified: benches/datalog_bench.rs, bootstrap.rs, incremental/cdc.rs, indexer.rs, iterator/{slate_iterator,slate_key_iterator,temporal_filter_iterator}.rs, lib.rs, node.rs, query/patterns/triple.rs, tempids.rs, tx.rs.
++- Previous agent's stated next steps: a public storage-stats hook for the bench (key count / bytes per index), the cross-size equivalence test, and bench output for storage numbers.
++
++## Next
++1. Run bench with TRIPLOX_SEGMENT_SIZE=256 and check row counts against baseline. Fix correctness first.
++2. Storage-stats hook + bench output; equivalence test across sizes including an as-of query.
++3. cargo test -p triplox (with default size 1 and with 256), clippy.
++4. A/B bench (size 1 vs best size, 3 each alternating) plus one run at each other size.
++5. EXPERIMENT.md (mention the 65 KiB key limit and CDC), fmt, commit.
++
++## Shared context
++
++Toolchain: every shell needs `export PATH="$HOME/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin:$PATH"` and `export CARGO_BUILD_JOBS=3`. Never run `cargo clean`. Work only in this worktree.
++
++Benchmark: `cargo bench --bench datalog_bench` (env VERTICES, EDGE_PROB, RUNS, BENCH_OUT). Baseline JSON: /private/tmp/claude-501/-Users-ben-code-triplox/2cc95019-6318-4527-8430-7ad4b12972b9/scratchpad/results/baseline.json. Baseline medians (ms): triangles 537 (7821 rows), two_hop_count 223, three_hop_count 7041, out_degree 44 (2000 rows), in_degree_top 44 (2000 rows), neighbors_of_42 1.1 (21 rows), weight_filter 3.7 (198 rows), weight_sum 3.6, heavy_neighbors 68 (1908 rows), label_lookup 0.02 (1 row).
++
++Definition of done:
++1. Feature behind an env toggle; results identical on/off (row counts match baseline; an on/off equivalence test on a small graph).
++2. `cargo test -p triplox` and `cargo clippy -p triplox --all-targets` pass, or failures are listed here honestly.
++3. A/B interleaved bench, 3 runs each; JSON written to /private/tmp/claude-501/-Users-ben-code-triplox/2cc95019-6318-4527-8430-7ad4b12972b9/scratchpad/results/datom-segments-off.json and /private/tmp/claude-501/-Users-ben-code-triplox/2cc95019-6318-4527-8430-7ad4b12972b9/scratchpad/results/datom-segments-on.json.
++4. EXPERIMENT.md at worktree root: what was built, hook points (file:line), A/B table, what failed, honest verdict and integration cost.
++5. `cargo fmt`; commit on this branch; do not push; no GitHub issues/PRs.
++
++## Progress protocol
++
++After every milestone (compiles, test passes, bench run, doc written): update the Status and Next sections below, then `git add -A && git commit -q -m "wip(datom-segments): <milestone>"`. Commit even if incomplete. This file is the hand-off; a fresh agent must be able to continue from it alone.
+diff --git a/benches/datalog_bench.rs b/benches/datalog_bench.rs
+index 98a2ef0..6cba6b0 100644
+--- a/benches/datalog_bench.rs
++++ b/benches/datalog_bench.rs
+@@ -171,10 +171,31 @@ async fn main() {
+     }
+     let ingest_ms = ingest_start.elapsed().as_secs_f64() * 1000.0;
+ 
++    let segment_size = env_or("TRIPLOX_SEGMENT_SIZE", 1usize);
+     println!(
+-        "vertices={vertices} edges={} edge_prob={edge_prob} runs={runs} ingest_ms={ingest_ms:.1}",
++        "vertices={vertices} edges={} edge_prob={edge_prob} runs={runs} segment_size={segment_size} ingest_ms={ingest_ms:.1}",
+         edges.len()
+     );
++    let storage = node.index_storage().await.expect("index storage");
++    println!(
++        "{:<6} {:>10} {:>10} {:>12} {:>12}",
++        "index", "keys", "datoms", "key_bytes", "value_bytes"
++    );
++    for s in &storage {
++        println!(
++            "{:<6} {:>10} {:>10} {:>12} {:>12}",
++            s.index, s.keys, s.datoms, s.key_bytes, s.value_bytes
++        );
++    }
++    let storage_json: Vec<String> = storage
++        .iter()
++        .map(|s| {
++            format!(
++                "{{\"index\":\"{}\",\"keys\":{},\"datoms\":{},\"key_bytes\":{},\"value_bytes\":{}}}",
++                s.index, s.keys, s.datoms, s.key_bytes, s.value_bytes
++            )
++        })
++        .collect();
+     println!(
+         "{:<18} {:>10} {:>12} {:>12}",
+         "query", "rows", "min_ms", "median_ms"
+@@ -202,8 +223,9 @@ async fn main() {
+ 
+     if let Ok(path) = std::env::var("BENCH_OUT") {
+         let body = format!(
+-            "{{\"vertices\":{vertices},\"edges\":{},\"edge_prob\":{edge_prob},\"ingest_ms\":{ingest_ms:.1},\"queries\":[{}]}}\n",
++            "{{\"vertices\":{vertices},\"edges\":{},\"edge_prob\":{edge_prob},\"segment_size\":{segment_size},\"ingest_ms\":{ingest_ms:.1},\"storage\":[{}],\"queries\":[{}]}}\n",
+             edges.len(),
++            storage_json.join(","),
+             json.join(",")
+         );
+         std::fs::write(&path, body).expect("write BENCH_OUT");
+diff --git a/src/bootstrap.rs b/src/bootstrap.rs
+index 42134c0..a08131f 100644
+--- a/src/bootstrap.rs
++++ b/src/bootstrap.rs
+@@ -10,7 +10,8 @@ use crate::partition::{
+     USER_PARTITION,
+ };
+ use crate::schema::{bootstrap_schema, bootstrap_schema_tx, load_schema_from_indices, Schema};
+-use crate::slate::{SlateComponents, DEFAULT_SCAN_OPTIONS, DEFAULT_WRITE_OPTIONS};
++use crate::segment::{self, KeyCursor};
++use crate::slate::{SlateComponents, DEFAULT_WRITE_OPTIONS};
+ use crate::tempids;
+ use crate::transaction::TxKey;
+ use crate::tx;
+@@ -45,14 +46,13 @@ pub(crate) async fn scan_partition_counters(slatedb: &Db) -> Result<PartitionMap
+         pm.insert(partition, 0);
+ 
+         let prefix = concat_bytes(&[&[codec::EAV], &partition_entity_prefix(partition)]);
+-        let mut iter = slatedb
+-            .scan_prefix_with_options(&prefix, .., &DEFAULT_SCAN_OPTIONS)
++        let mut iter = KeyCursor::scan_prefix(slatedb, &prefix)
+             .await
+             .context("Failed to scan EAV partition prefix")?;
+ 
+-        if let Some(kv) = iter.next().await.context("Failed to read EAV key")? {
++        if let Some(key) = iter.next().await.context("Failed to read EAV key")? {
+             let mut cursor: &[u8] =
+-                &kv.key[codec::CODEC_LENGTH..codec::CODEC_LENGTH + codec::ENTITY_LENGTH];
++                &key[codec::CODEC_LENGTH..codec::CODEC_LENGTH + codec::ENTITY_LENGTH];
+             let eid = match codec::decode_datatype(&mut cursor)
+                 .context("Failed to decode entity ID from EAV key")?
+             {
+@@ -131,7 +131,16 @@ pub async fn init_db(slate: &SlateComponents) -> Result<Metadata> {
+             );
+ 
+             let mut batch = WriteBatch::new();
+-            write_index_entries(&mut batch, &datoms, &bootstrap_schema, BOOTSTRAP_TX_EID).unwrap();
++            write_index_entries(
++                slate.db.as_ref(),
++                &mut batch,
++                &datoms,
++                &bootstrap_schema,
++                BOOTSTRAP_TX_EID,
++                segment::configured_segment_size(),
++            )
++            .await
++            .unwrap();
+             // Write version
+             let version = env!("CARGO_PKG_VERSION");
+             batch.put(&version_key, version.as_bytes());
+diff --git a/src/incremental/cdc.rs b/src/incremental/cdc.rs
+index b552aa7..15e57f1 100644
+--- a/src/incremental/cdc.rs
++++ b/src/incremental/cdc.rs
+@@ -20,8 +20,8 @@ use crate::node::SchemaProvider;
+ use crate::ops::{DataType, Datom, DatomOp};
+ use crate::partition::{extract_counter, extract_partition, TX_PARTITION};
+ use crate::schema::Schema;
++use crate::segment::KeyCursor;
+ use crate::slate::cdc::{CdcCursor, CdcStream};
+-use crate::slate::DEFAULT_SCAN_OPTIONS;
+ use crate::transaction::TxKey;
+ use crate::{codec, util::concat_bytes};
+ 
+@@ -144,15 +144,10 @@ where
+         .collect::<HashSet<_>>();
+     let mut latest_by_triple: HashMap<EncodedTriple, (i64, u8)> = HashMap::new();
+     // TODO: This needs to be done efficiently via AVE/AEV using attribute and query constants. See #329.
+-    let mut iter = db
+-        .scan_with_options(
+-            concat_bytes(&[&[codec::EAV]])..vec![codec::EAV_END],
+-            &DEFAULT_SCAN_OPTIONS,
+-        )
+-        .await?;
++    let mut iter = KeyCursor::scan_prefix(db, &[codec::EAV]).await?;
+ 
+-    while let Some(kv) = iter.next().await? {
+-        let (entity, attribute, value, tx_eid, op) = eav_key_to_parts(kv.key)?;
++    while let Some(key) = iter.next().await? {
++        let (entity, attribute, value, tx_eid, op) = eav_key_to_parts(key)?;
+         if tx_eid > as_of_tx_eid || !attributes.contains(&attribute) {
+             continue;
+         }
+diff --git a/src/indexer.rs b/src/indexer.rs
+index d137de2..8127b08 100644
+--- a/src/indexer.rs
++++ b/src/indexer.rs
+@@ -20,7 +20,8 @@ use crate::ops::DataType;
+ use crate::ops::{Datom, DatomOp, Entid, TxOp};
+ use crate::partition::{extract_counter, partition_entity_prefix, tx_eid_from_tx_id, TX_PARTITION};
+ use crate::schema::{Schema, DB_TX_ABORTED, DB_TX_COMMITTED};
+-use crate::slate::{DEFAULT_SCAN_OPTIONS, DEFAULT_WRITE_OPTIONS};
++use crate::segment::{self, KeyCursor};
++use crate::slate::DEFAULT_WRITE_OPTIONS;
+ use crate::tempids;
+ use crate::transaction::TxKey;
+ use crate::tx;
+@@ -47,15 +48,39 @@ pub struct Indexer {
+     metadata: Metadata,
+     latest_indexed_tx: TxKey,
+     tx_completion_sender: broadcast::Sender<TxCompletion>,
++    segment_size: usize,
+ }
+ 
+-/// Write index entries for datoms into a SlateDB WriteBatch.
+-pub(crate) fn write_index_entries(
++/// Write index entries for datoms into a SlateDB WriteBatch. With `segment_size > 1`
++/// the keys are merged into existing segments, which needs reads from `db`.
++pub(crate) async fn write_index_entries<D>(
++    db: &D,
+     batch: &mut WriteBatch,
+     datoms: &[Datom],
+     schema: &Schema,
+     tx_eid: i64,
+-) -> Result<(), Error> {
++    segment_size: usize,
++) -> Result<(), Error>
++where
++    D: DbReadOps + Sync,
++{
++    let keys = index_keys(datoms, schema, tx_eid)?;
++    if segment_size <= 1 {
++        for key in keys {
++            batch.put(&key, b"");
++        }
++        return Ok(());
++    }
++    segment::write_segmented(db, batch, keys, segment_size).await
++}
++
++/// Build the index keys (EAV, AVE, AEV, VAE, AE, AV) for datoms.
++pub(crate) fn index_keys(
++    datoms: &[Datom],
++    schema: &Schema,
++    tx_eid: i64,
++) -> Result<Vec<Vec<u8>>, Error> {
++    let mut keys = Vec::with_capacity(datoms.len() * 6);
+     let tx_eid_bytes = encode_i64_bytes(tx_eid);
+     let mut key_buf: Vec<u8> = Vec::with_capacity(64);
+     let mut value_buf: Vec<u8> = Vec::with_capacity(32);
+@@ -90,7 +115,7 @@ pub(crate) fn write_index_entries(
+         key_buf.extend_from_slice(value);
+         key_buf.extend_from_slice(&tx_eid_bytes);
+         key_buf.push(op_byte);
+-        batch.put(&key_buf, b"");
++        keys.push(key_buf.clone());
+ 
+         // AVE
+         key_buf.clear();
+@@ -100,7 +125,7 @@ pub(crate) fn write_index_entries(
+         key_buf.extend_from_slice(entity_bytes);
+         key_buf.extend_from_slice(&tx_eid_bytes);
+         key_buf.push(op_byte);
+-        batch.put(&key_buf, b"");
++        keys.push(key_buf.clone());
+ 
+         // AEV
+         key_buf.clear();
+@@ -110,7 +135,7 @@ pub(crate) fn write_index_entries(
+         key_buf.extend_from_slice(value);
+         key_buf.extend_from_slice(&tx_eid_bytes);
+         key_buf.push(op_byte);
+-        batch.put(&key_buf, b"");
++        keys.push(key_buf.clone());
+ 
+         // VAE is a unique-only index used for uniqueness checks, lookup refs,
+         // and :db.unique/identity upsert resolution.
+@@ -122,7 +147,7 @@ pub(crate) fn write_index_entries(
+             key_buf.extend_from_slice(entity_bytes);
+             key_buf.extend_from_slice(&tx_eid_bytes);
+             key_buf.push(op_byte);
+-            batch.put(&key_buf, b"");
++            keys.push(key_buf.clone());
+         }
+ 
+         // AE and AV are atemporal, purely additive indices.
+@@ -132,17 +157,17 @@ pub(crate) fn write_index_entries(
+             key_buf.push(codec::AE);
+             key_buf.extend_from_slice(&attr_bytes);
+             key_buf.extend_from_slice(entity_bytes);
+-            batch.put(&key_buf, b"");
++            keys.push(key_buf.clone());
+ 
+             key_buf.clear();
+             key_buf.push(codec::AV);
+             key_buf.extend_from_slice(&attr_bytes);
+             key_buf.extend_from_slice(value);
+-            batch.put(&key_buf, b"");
++            keys.push(key_buf.clone());
+         }
+     }
+ 
+-    Ok(())
++    Ok(keys)
+ }
+ 
+ /// Scan EAV entries for TX_PARTITION entities and return the `TxKey` of the latest tx.
+@@ -158,13 +183,11 @@ where
+     D: DbReadOps + Sync,
+ {
+     let eav_tx_prefix = concat_bytes(&[&[codec::EAV], &partition_entity_prefix(TX_PARTITION)]);
+-    let mut iter = sdb
+-        .scan_prefix_with_options(&eav_tx_prefix, .., &DEFAULT_SCAN_OPTIONS)
+-        .await?;
++    let mut iter = KeyCursor::scan_prefix(sdb, &eav_tx_prefix).await?;
+     let mut first_eid: Option<i64> = None;
+     let mut system_time: Option<crate::clock::Instant> = None;
+-    while let Some(kv) = iter.next().await? {
+-        let (entity_dt, attribute, value, _tx_eid, _op) = eav_key_to_parts(kv.key)?;
++    while let Some(key) = iter.next().await? {
++        let (entity_dt, attribute, value, _tx_eid, _op) = eav_key_to_parts(key)?;
+         let eid = match entity_dt {
+             DataType::Long(id) => id,
+             other => bail!("Expected Long entity ID in EAV key, got {:?}", other),
+@@ -247,14 +270,23 @@ impl Indexer {
+         tx_completion_capacity: usize,
+     ) -> Self {
+         let (tx_completion_sender, _) = broadcast::channel(tx_completion_capacity);
++        let segment_size = segment::configured_segment_size();
++        segment::set_estimate_scale(segment_size);
+         Indexer {
+             slatedb,
+             metadata,
+             latest_indexed_tx,
+             tx_completion_sender,
++            segment_size,
+         }
+     }
+ 
++    /// Datoms per SlateDB key for subsequent writes; 1 is today's one-key-per-datom layout.
++    pub fn set_segment_size(&mut self, segment_size: usize) {
++        self.segment_size = segment_size.max(1);
++        segment::set_estimate_scale(self.segment_size);
++    }
++
+     pub fn metadata(&self) -> &Metadata {
+         &self.metadata
+     }
+@@ -352,7 +384,15 @@ impl Indexer {
+ 
+         // 9. Write indices + commit
+         let mut batch = WriteBatch::new();
+-        write_index_entries(&mut batch, &datoms, &self.metadata.schema, tx_eid)?;
++        write_index_entries(
++            self.slatedb.as_ref(),
++            &mut batch,
++            &datoms,
++            &self.metadata.schema,
++            tx_eid,
++            self.segment_size,
++        )
++        .await?;
+         self.slatedb
+             .write_with_options(batch, &DEFAULT_WRITE_OPTIONS)
+             .await?;
+@@ -561,7 +601,15 @@ impl Indexer {
+         pending_pm.set_tx_counter(tx_key.tx_id)?;
+         let datoms = build_tx_entity_datoms(tx_eid, tx_key, false, Some(error));
+         let mut batch = WriteBatch::new();
+-        write_index_entries(&mut batch, &datoms, &self.metadata.schema, tx_eid)?;
++        write_index_entries(
++            self.slatedb.as_ref(),
++            &mut batch,
++            &datoms,
++            &self.metadata.schema,
++            tx_eid,
++            self.segment_size,
++        )
++        .await?;
+         self.slatedb
+             .write_with_options(batch, &DEFAULT_WRITE_OPTIONS)
+             .await?;
+diff --git a/src/iterator/slate_iterator.rs b/src/iterator/slate_iterator.rs
+index 5a15e0a..608d9a0 100644
+--- a/src/iterator/slate_iterator.rs
++++ b/src/iterator/slate_iterator.rs
+@@ -6,7 +6,7 @@ use anyhow::Error;
+ use slatedb::{DbMetadataOps, DbReadOps};
+ use tokio::runtime::Handle;
+ 
+-use crate::slate::DEFAULT_SCAN_OPTIONS;
++use crate::segment::{self, KeyCursor};
+ 
+ pub(crate) trait Index {
+     fn count(&self) -> Result<u64, Error>;
+@@ -23,7 +23,7 @@ pub(crate) struct SlateIterator<M>
+ where
+     M: DbMetadataOps + Send + Sync,
+ {
+-    inner: slatedb::DbIterator,
++    inner: KeyCursor,
+     current_key: Option<Bytes>,
+     prefix: Bytes,
+     handle: Handle,
+@@ -46,12 +46,8 @@ where
+         D: DbReadOps + Send + Sync,
+     {
+         let prefix_bytes = Bytes::from(prefix.to_vec());
+-        let mut iterator =
+-            handle.block_on(slate.scan_prefix_with_options(prefix, .., &DEFAULT_SCAN_OPTIONS))?;
+-        let mut current_key = None;
+-        if let Some(next_key) = handle.block_on(iterator.next())? {
+-            current_key = Some(next_key.key.clone());
+-        }
++        let mut iterator = handle.block_on(KeyCursor::scan_prefix(slate, prefix))?;
++        let current_key = handle.block_on(iterator.next())?;
+         Ok(Self {
+             inner: iterator,
+             current_key,
+@@ -71,34 +67,32 @@ where
+         Ok(self.handle.block_on(
+             self.range_stats
+                 .estimate_key_count_with_prefix(&self.prefix),
+-        )?)
++        )? * segment::estimate_scale())
+     }
+ 
+     fn seek(&mut self, extension: Bytes) -> Result<(), Error> {
+         let mut full_key = self.prefix.to_vec();
+         full_key.extend_from_slice(&extension);
+-        let full_key = Bytes::from(full_key);
+ 
+         // SlateDB forbids backward seeks. If already at or past the target, skip the seek.
+         // TODO: check if this extra check can be avoided. Normally we should only seek forwards.
+         match &self.current_key {
+-            Some(current) if current.as_ref() >= full_key.as_ref() => return Ok(()),
++            Some(current) if current.as_ref() >= full_key.as_slice() => return Ok(()),
+             _ => {}
+         }
+ 
+-        self.handle.block_on(self.inner.seek(full_key))?;
++        self.handle.block_on(self.inner.seek(&full_key))?;
+ 
+         // Update current_key so get_value() reflects the new position.
+-        let next_entry = self.handle.block_on(self.inner.next())?;
+-        self.current_key = next_entry.map(|e| e.key.clone());
++        self.current_key = self.handle.block_on(self.inner.next())?;
+         Ok(())
+     }
+ 
+     fn next(&mut self) -> Result<Option<Bytes>, Error> {
+         let next_key = self.handle.block_on(self.inner.next())?;
+         if let Some(next_key) = next_key {
+-            self.current_key = Some(next_key.key.clone());
+-            Ok(Some((self.extractor)(next_key.key)))
++            self.current_key = Some(next_key.clone());
++            Ok(Some((self.extractor)(next_key)))
+         } else {
+             self.current_key = None;
+             Ok(None)
+diff --git a/src/iterator/slate_key_iterator.rs b/src/iterator/slate_key_iterator.rs
+index 8f1a899..2b82145 100644
+--- a/src/iterator/slate_key_iterator.rs
++++ b/src/iterator/slate_key_iterator.rs
+@@ -1,19 +1,17 @@
+ use anyhow::Result;
+ use bytes::Bytes;
+ 
+-use crate::slate::DEFAULT_SCAN_OPTIONS;
++use crate::segment::KeyCursor;
+ 
+ pub(crate) struct SlateKeyIterator {
+-    inner: slatedb::DbIterator,
++    inner: KeyCursor,
+     current_key: Option<Bytes>,
+ }
+ 
+ impl SlateKeyIterator {
+     pub async fn scan_prefix(db: &slatedb::Db, prefix: &[u8]) -> Result<Self> {
+-        let mut inner = db
+-            .scan_prefix_with_options(prefix, .., &DEFAULT_SCAN_OPTIONS)
+-            .await?;
+-        let current_key = inner.next().await?.map(|kv| kv.key);
++        let mut inner = KeyCursor::scan_prefix(db, prefix).await?;
++        let current_key = inner.next().await?;
+         Ok(Self { inner, current_key })
+     }
+ 
+@@ -24,13 +22,13 @@ impl SlateKeyIterator {
+             }
+         }
+ 
+-        self.inner.seek(Bytes::copy_from_slice(key)).await?;
+-        self.current_key = self.inner.next().await?.map(|kv| kv.key);
++        self.inner.seek(key).await?;
++        self.current_key = self.inner.next().await?;
+         Ok(())
+     }
+ 
+     pub async fn next(&mut self) -> Result<Option<Bytes>> {
+-        self.current_key = self.inner.next().await?.map(|kv| kv.key);
++        self.current_key = self.inner.next().await?;
+         Ok(self.current_key.clone())
+     }
+ 
+diff --git a/src/iterator/temporal_filter_iterator.rs b/src/iterator/temporal_filter_iterator.rs
+index eaec3f3..38a9e0a 100644
+--- a/src/iterator/temporal_filter_iterator.rs
++++ b/src/iterator/temporal_filter_iterator.rs
+@@ -7,7 +7,7 @@ use slatedb::{DbMetadataOps, DbReadOps};
+ use tokio::runtime::Handle;
+ 
+ use crate::codec;
+-use crate::slate::DEFAULT_SCAN_OPTIONS;
++use crate::segment::{self, KeyCursor};
+ use crate::util::next_prefix;
+ 
+ use super::slate_iterator::{Extractor, Index};
+@@ -26,7 +26,7 @@ pub(crate) struct TemporalFilterIterator<M>
+ where
+     M: DbMetadataOps + Send + Sync,
+ {
+-    inner: slatedb::DbIterator,
++    inner: KeyCursor,
+     current_key: Option<Bytes>,
+     prefix: Bytes,
+     handle: Handle,
+@@ -58,8 +58,7 @@ where
+     {
+         let prefix_bytes = Bytes::from(prefix.to_vec());
+         let as_of_encoded = codec::encode_i64_bytes(as_of);
+-        let iterator =
+-            handle.block_on(slate.scan_prefix_with_options(prefix, .., &DEFAULT_SCAN_OPTIONS))?;
++        let iterator = handle.block_on(KeyCursor::scan_prefix(slate, prefix))?;
+ 
+         let mut iter = Self {
+             inner: iterator,
+@@ -82,7 +81,7 @@ where
+         // Assumes prefix-free value encodings
+         match next_prefix(logical_key(key)) {
+             Some(target) => {
+-                self.handle.block_on(self.inner.seek(Bytes::from(target)))?;
++                self.handle.block_on(self.inner.seek(&target))?;
+                 Ok(true)
+             }
+             None => Ok(false),
+@@ -99,8 +98,7 @@ where
+                     self.current_key = None;
+                     return Ok(());
+                 }
+-                Some(kv) => {
+-                    let key = kv.key;
++                Some(key) => {
+                     assert!(
+                         key.len() >= codec::TX_EID_OP_SUFFIX,
+                         "Key too short ({} bytes) to contain tx_eid + op suffix",
+@@ -151,23 +149,22 @@ where
+         Ok(self.handle.block_on(
+             self.range_stats
+                 .estimate_key_count_with_prefix(&self.prefix),
+-        )?)
++        )? * segment::estimate_scale())
+     }
+ 
+     fn seek(&mut self, extension: Bytes) -> Result<(), Error> {
+         let mut full_key = self.prefix.to_vec();
+         full_key.extend_from_slice(&extension);
+-        let full_key = Bytes::from(full_key);
+ 
+         // Skip forward if already past the target
+         if let Some(current) = &self.current_key {
+             let current_logical = logical_key(current);
+-            if current_logical >= full_key.as_ref() {
++            if current_logical >= full_key.as_slice() {
+                 return Ok(());
+             }
+         }
+ 
+-        self.handle.block_on(self.inner.seek(full_key))?;
++        self.handle.block_on(self.inner.seek(&full_key))?;
+         self.advance_to_next_valid()
+     }
+ 
+diff --git a/src/lib.rs b/src/lib.rs
+index b01c640..f11bb2b 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -27,6 +27,7 @@ mod query_validation;
+ pub mod schema;
+ #[cfg(not(any(test, feature = "test-helpers")))]
+ mod schema;
++pub(crate) mod segment;
+ mod slate;
+ mod tempids;
+ pub mod tx;
+@@ -38,5 +39,7 @@ pub mod config;
+ pub mod node;
+ pub mod server;
+ 
+-pub use node::{Database, IntoQuery, Node, QueryNode, SubmitNode, TransactionResult, TxKey, DB};
++pub use node::{
++    Database, IndexStorage, IntoQuery, Node, QueryNode, SubmitNode, TransactionResult, TxKey, DB,
++};
+ pub use triplox_client::{client, msgpack_codec, protocol, subscription, transaction};
+diff --git a/src/node.rs b/src/node.rs
+index 1e3225c..e4b5daf 100644
+--- a/src/node.rs
++++ b/src/node.rs
+@@ -219,7 +219,59 @@ impl Node<KafkaLog> {
+     }
+ }
+ 
++/// Physical size of one index in SlateDB.
++#[derive(Debug, Clone)]
++pub struct IndexStorage {
++    pub index: &'static str,
++    pub keys: u64,
++    pub datoms: u64,
++    pub key_bytes: u64,
++    pub value_bytes: u64,
++}
++
+ impl<L: TxLog> Node<L> {
++    /// Datoms per SlateDB key for subsequent writes (see `TRIPLOX_SEGMENT_SIZE`).
++    pub async fn set_segment_size(&self, segment_size: usize) {
++        self.indexer.write().await.set_segment_size(segment_size);
++    }
++
++    /// Scan every index and report SlateDB key count and bytes, for storage experiments.
++    pub async fn index_storage(&self) -> Result<Vec<IndexStorage>, Error> {
++        let mut out = Vec::new();
++        for (index, name) in [
++            (crate::codec::EAV, "EAV"),
++            (crate::codec::AVE, "AVE"),
++            (crate::codec::AEV, "AEV"),
++            (crate::codec::AE, "AE"),
++            (crate::codec::AV, "AV"),
++            (crate::codec::VAE, "VAE"),
++        ] {
++            let mut iter = self
++                .slate
++                .db
++                .scan_with_options(
++                    vec![index]..vec![index + 1],
++                    &crate::slate::DEFAULT_SCAN_OPTIONS,
++                )
++                .await?;
++            let mut stats = IndexStorage {
++                index: name,
++                keys: 0,
++                datoms: 0,
++                key_bytes: 0,
++                value_bytes: 0,
++            };
++            while let Some(kv) = iter.next().await? {
++                stats.keys += 1;
++                stats.key_bytes += kv.key.len() as u64;
++                stats.value_bytes += kv.value.len() as u64;
++                stats.datoms += crate::segment::decode_segment(&kv.key, &kv.value)?.len() as u64;
++            }
++            out.push(stats);
++        }
++        Ok(out)
++    }
++
+     pub async fn close(self) -> Result<(), Error> {
+         let incremental_result = self.incremental.shutdown().await;
+         self.subscription.cancel();
+diff --git a/src/query/patterns/triple.rs b/src/query/patterns/triple.rs
+index fd0ac0d..a9d473c 100644
+--- a/src/query/patterns/triple.rs
++++ b/src/query/patterns/triple.rs
+@@ -13,6 +13,7 @@ use crate::iterator::slate_iterator::{Extractor, Index, SlateIterator};
+ use crate::iterator::temporal_filter_iterator::TemporalFilterIterator;
+ use crate::query::binding_bag::{BindingBag, BindingRow};
+ use crate::query::exec_pattern::{ExecPattern, PatternId, Proposal};
++use crate::segment;
+ use crate::util::make_extractor;
+ 
+ #[derive(Clone, Debug, Eq, PartialEq)]
+@@ -113,7 +114,7 @@ where
+             .db
+             .handle()
+             .block_on(self.db.range_stats().estimate_key_count_with_prefix(prefix))?;
+-        Ok(usize::try_from(count)?)
++        Ok(usize::try_from(count * segment::estimate_scale())?)
+     }
+ 
+     fn create_iterator(
+diff --git a/src/segment.rs b/src/segment.rs
+new file mode 100644
+index 0000000..4599967
+--- /dev/null
++++ b/src/segment.rs
+@@ -0,0 +1,682 @@
++//! Datomic-style segments: up to N sorted datom keys stored under one SlateDB key.
++//!
++//! Physical layout per index:
++//! - plain entry: `key = datom key`, `value = ""` (today's layout, segment size 1)
++//! - segment: `key = last datom key in the segment`, `value = (u16 BE len, datom key)*`
++//!
++//! Keying a segment by its last datom means a forward SlateDB seek to `target` lands on
++//! exactly the segment that could contain `target`. Readers accept both layouts in the
++//! same index, so the writer's segment size can change between transactions.
++
++use std::sync::atomic::{AtomicUsize, Ordering};
++
++use anyhow::{bail, Result};
++use bytes::Bytes;
++use slatedb::config::ScanOptions;
++use slatedb::{DbReadOps, IterationOrder, WriteBatch};
++
++use crate::slate::DEFAULT_SCAN_OPTIONS;
++use crate::util::next_prefix;
++
++pub const ENV_SEGMENT_SIZE: &str = "TRIPLOX_SEGMENT_SIZE";
++
++/// Segment size from `TRIPLOX_SEGMENT_SIZE`; 1 keeps today's one-key-per-datom layout.
++pub fn configured_segment_size() -> usize {
++    std::env::var(ENV_SEGMENT_SIZE)
++        .ok()
++        .and_then(|v| v.parse::<usize>().ok())
++        .filter(|n| *n >= 1)
++        .unwrap_or(1)
++}
++
++// Key-count estimates come from SST statistics and count SlateDB keys, not datoms. The
++// writer publishes its segment size here so estimates stay proportional across layouts.
++static ESTIMATE_SCALE: AtomicUsize = AtomicUsize::new(1);
++
++pub fn set_estimate_scale(segment_size: usize) {
++    ESTIMATE_SCALE.store(segment_size.max(1), Ordering::Relaxed);
++}
++
++pub fn estimate_scale() -> u64 {
++    ESTIMATE_SCALE.load(Ordering::Relaxed) as u64
++}
++
++pub fn encode_segment(keys: &[Bytes]) -> Vec<u8> {
++    let mut out = Vec::with_capacity(keys.iter().map(|k| k.len() + 2).sum());
++    for key in keys {
++        let len = u16::try_from(key.len()).expect("datom key exceeds u16 length");
++        out.extend_from_slice(&len.to_be_bytes());
++        out.extend_from_slice(key);
++    }
++    out
++}
++
++/// Datom keys held by one SlateDB entry. An empty value is a plain single-datom entry.
++pub fn decode_segment(key: &Bytes, value: &Bytes) -> Result<Vec<Bytes>> {
++    if value.is_empty() {
++        return Ok(vec![key.clone()]);
++    }
++    let mut keys = Vec::new();
++    let mut pos = 0;
++    while pos < value.len() {
++        if pos + 2 > value.len() {
++            bail!("truncated segment length prefix");
++        }
++        let len = u16::from_be_bytes([value[pos], value[pos + 1]]) as usize;
++        pos += 2;
++        if pos + len > value.len() {
++            bail!("truncated segment entry");
++        }
++        keys.push(value.slice(pos..pos + len));
++        pos += len;
++    }
++    Ok(keys)
++}
++
++enum Current {
++    None,
++    Single(Bytes),
++    Segment(Vec<Bytes>),
++}
++
++/// Forward cursor over datom keys of one index, transparent to the physical layout.
++/// Pull style: `next()` yields the current datom and advances; `seek()` positions so
++/// that the next `next()` yields the first datom `>= target`. Forward-only, like SlateDB.
++pub(crate) struct KeyCursor {
++    inner: slatedb::DbIterator,
++    end: Option<Vec<u8>>,
++    current: Current,
++    pos: usize,
++    exhausted: bool,
++}
++
++impl KeyCursor {
++    /// Cursor over all datoms starting with `prefix` (first byte is the index byte).
++    pub async fn scan_prefix<D>(db: &D, prefix: &[u8]) -> Result<Self>
++    where
++        D: DbReadOps + Sync,
++    {
++        assert!(!prefix.is_empty(), "prefix must start with an index byte");
++        // A segment holding the tail of the prefix range is keyed past it, so scan to the
++        // end of the index and stop at the first datom outside the prefix.
++        let index_end = next_prefix(&prefix[..1]);
++        let range = (
++            std::ops::Bound::Included(prefix.to_vec()),
++            match &index_end {
++                Some(end) => std::ops::Bound::Excluded(end.clone()),
++                None => std::ops::Bound::Unbounded,
++            },
++        );
++        let inner = db.scan_with_options(range, &DEFAULT_SCAN_OPTIONS).await?;
++        let mut cursor = Self {
++            inner,
++            end: next_prefix(prefix),
++            current: Current::None,
++            pos: 0,
++            exhausted: false,
++        };
++        cursor.load_next().await?;
++        cursor.skip_below(prefix);
++        Ok(cursor)
++    }
++
++    async fn load_next(&mut self) -> Result<()> {
++        match self.inner.next().await? {
++            None => {
++                self.current = Current::None;
++                self.exhausted = true;
++            }
++            Some(kv) => {
++                self.current = if kv.value.is_empty() {
++                    Current::Single(kv.key)
++                } else {
++                    Current::Segment(decode_segment(&kv.key, &kv.value)?)
++                };
++                self.pos = 0;
++            }
++        }
++        Ok(())
++    }
++
++    fn current_len(&self) -> usize {
++        match &self.current {
++            Current::None => 0,
++            Current::Single(_) => 1,
++            Current::Segment(keys) => keys.len(),
++        }
++    }
++
++    fn current_at(&self, pos: usize) -> &Bytes {
++        match &self.current {
++            Current::Single(key) => key,
++            Current::Segment(keys) => &keys[pos],
++            Current::None => unreachable!("no current entry"),
++        }
++    }
++
++    /// Advance `pos` past datoms below `target` within the loaded entry.
++    fn skip_below(&mut self, target: &[u8]) {
++        match &self.current {
++            Current::None => {}
++            Current::Single(key) => {
++                if key.as_ref() < target {
++                    self.pos = 1;
++                }
++            }
++            Current::Segment(keys) => {
++                let from = self.pos;
++                self.pos = from + keys[from..].partition_point(|k| k.as_ref() < target);
++            }
++        }
++    }
++
++    fn past_end(&self, key: &[u8]) -> bool {
++        self.end.as_deref().is_some_and(|end| key >= end)
++    }
++
++    pub fn peek(&self) -> Option<&Bytes> {
++        if self.exhausted || self.pos >= self.current_len() {
++            return None;
++        }
++        Some(self.current_at(self.pos))
++    }
++
++    pub async fn next(&mut self) -> Result<Option<Bytes>> {
++        if self.exhausted {
++            return Ok(None);
++        }
++        if self.pos >= self.current_len() {
++            self.load_next().await?;
++            if self.exhausted {
++                return Ok(None);
++            }
++        }
++        let key = self.current_at(self.pos).clone();
++        if self.past_end(&key) {
++            self.exhausted = true;
++            self.current = Current::None;
++            return Ok(None);
++        }
++        self.pos += 1;
++        Ok(Some(key))
++    }
++
++    pub async fn seek(&mut self, target: &[u8]) -> Result<()> {
++        if self.exhausted {
++            return Ok(());
++        }
++        if self.past_end(target) {
++            self.exhausted = true;
++            self.current = Current::None;
++            return Ok(());
++        }
++        let len = self.current_len();
++        if len > 0 && self.current_at(len - 1).as_ref() >= target {
++            self.skip_below(target);
++            return Ok(());
++        }
++        // Target is beyond the loaded entry, whose key is the last SlateDB key returned,
++        // so the forward seek is legal.
++        self.inner.seek(target).await?;
++        self.load_next().await?;
++        self.skip_below(target);
++        Ok(())
++    }
++}
++
++/// Segment being edited during a write.
++struct Pending {
++    orig_key: Option<Bytes>,
++    datoms: Vec<Bytes>,
++}
++
++impl Pending {
++    fn insert(&mut self, key: Bytes) {
++        match self.datoms.binary_search(&key) {
++            Ok(_) => {}
++            Err(pos) => self.datoms.insert(pos, key),
++        }
++    }
++
++    fn flush(self, batch: &mut WriteBatch) {
++        let Some(last) = self.datoms.last() else {
++            return;
++        };
++        if let Some(orig) = &self.orig_key {
++            if orig != last {
++                batch.delete(orig);
++            }
++        }
++        batch.put(last, encode_segment(&self.datoms));
++    }
++}
++
++/// Merge sorted datom `keys` into the segments of their indexes, rewriting touched
++/// segments and splitting those that grow past `segment_size`.
++pub(crate) async fn write_segmented<D>(
++    db: &D,
++    batch: &mut WriteBatch,
++    mut keys: Vec<Vec<u8>>,
++    segment_size: usize,
++) -> Result<()>
++where
++    D: DbReadOps + Sync,
++{
++    keys.sort_unstable();
++    keys.dedup();
++    let descending = ScanOptions {
++        order: IterationOrder::Descending,
++        ..DEFAULT_SCAN_OPTIONS
++    };
++
++    for group in keys.chunk_by(|a, b| a[0] == b[0]) {
++        let index = group[0][0];
++        let mut iter = db
++            .scan_with_options(vec![index]..vec![index + 1], &DEFAULT_SCAN_OPTIONS)
++            .await?;
++        let mut pending: Option<Pending> = None;
++        let mut at_tail = false;
++
++        for key in group {
++            let key = Bytes::copy_from_slice(key);
++            let belongs_to_pending = pending
++                .as_ref()
++                .is_some_and(|p| at_tail || p.datoms.last().is_some_and(|last| key <= *last));
++            if !belongs_to_pending {
++                // `key` is above everything in `pending`, so the seek is forward.
++                iter.seek(&key).await?;
++                match iter.next().await? {
++                    Some(kv) => {
++                        if let Some(p) = pending.take() {
++                            p.flush(batch);
++                        }
++                        pending = Some(Pending {
++                            datoms: decode_segment(&kv.key, &kv.value)?,
++                            orig_key: Some(kv.key),
++                        });
++                    }
++                    None => {
++                        at_tail = true;
++                        if pending.is_none() {
++                            let mut last = db
++                                .scan_with_options(vec![index]..key.to_vec(), &descending)
++                                .await?;
++                            pending = Some(match last.next().await? {
++                                Some(kv) => Pending {
++                                    datoms: decode_segment(&kv.key, &kv.value)?,
++                                    orig_key: Some(kv.key),
++                                },
++                                None => Pending {
++                                    orig_key: None,
++                                    datoms: Vec::new(),
++                                },
++                            });
++                        }
++                    }
++                }
++            }
++            let p = pending.as_mut().expect("pending segment");
++            p.insert(key);
++            if p.datoms.len() > segment_size {
++                // Appends at the tail leave a full segment behind; splits elsewhere halve.
++                let split_at = if at_tail {
++                    segment_size
++                } else {
++                    p.datoms.len() / 2
++                };
++                let left: Vec<Bytes> = p.datoms.drain(..split_at).collect();
++                Pending {
++                    orig_key: None,
++                    datoms: left,
++                }
++                .flush(batch);
++            }
++        }
++        if let Some(p) = pending.take() {
++            p.flush(batch);
++        }
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::slate::{in_memory_slate, DEFAULT_WRITE_OPTIONS};
++
++    fn key(index: u8, suffix: &[u8]) -> Vec<u8> {
++        let mut k = vec![index];
++        k.extend_from_slice(suffix);
++        k
++    }
++
++    async fn all_keys(db: &slatedb::Db, prefix: &[u8]) -> Vec<Vec<u8>> {
++        let mut cursor = KeyCursor::scan_prefix(db, prefix).await.unwrap();
++        let mut out = Vec::new();
++        while let Some(k) = cursor.next().await.unwrap() {
++            out.push(k.to_vec());
++        }
++        out
++    }
++
++    async fn slate_entries(db: &slatedb::Db, index: u8) -> usize {
++        let mut iter = db
++            .scan_with_options(vec![index]..vec![index + 1], &DEFAULT_SCAN_OPTIONS)
++            .await
++            .unwrap();
++        let mut n = 0;
++        while iter.next().await.unwrap().is_some() {
++            n += 1;
++        }
++        n
++    }
++
++    #[test]
++    fn segment_roundtrip() {
++        let keys = vec![Bytes::from("aa"), Bytes::from("b"), Bytes::from("ccc")];
++        let value = Bytes::from(encode_segment(&keys));
++        assert_eq!(decode_segment(&keys[2], &value).unwrap(), keys);
++        assert_eq!(
++            decode_segment(&keys[0], &Bytes::new()).unwrap(),
++            vec![keys[0].clone()]
++        );
++    }
++
++    #[tokio::test]
++    async fn segmented_writes_match_plain_reads_for_every_size() {
++        // 300 keys in shuffled batches, written under several segment sizes, must read
++        // back identically and honour prefix scans and seeks.
++        let mut expected: Vec<Vec<u8>> = (0..300u32)
++            .map(|i| key(1, &format!("{:03}", (i * 7919) % 300).into_bytes()))
++            .collect();
++        expected.sort();
++        expected.dedup();
++
++        for size in [1usize, 2, 4, 64] {
++            let slate = in_memory_slate().await;
++            let db = slate.db.clone();
++            let keys: Vec<Vec<u8>> = (0..300u32)
++                .map(|i| key(1, &format!("{:03}", (i * 7919) % 300).into_bytes()))
++                .collect();
++            for chunk in keys.chunks(37) {
++                let mut batch = WriteBatch::new();
++                write_segmented(db.as_ref(), &mut batch, chunk.to_vec(), size)
++                    .await
++                    .unwrap();
++                db.write_with_options(batch, &DEFAULT_WRITE_OPTIONS)
++                    .await
++                    .unwrap();
++            }
++            assert_eq!(all_keys(&db, &[1]).await, expected, "size {size}");
++            let entries = slate_entries(&db, 1).await;
++            assert!(entries >= 300 / size, "size {size}: {entries} entries");
++            if size > 1 {
++                assert!(entries < 300, "size {size}: {entries} entries");
++            }
++
++            // Prefix in the middle of a segment.
++            let sub: Vec<Vec<u8>> = expected
++                .iter()
++                .filter(|k| k.starts_with(&key(1, b"12")))
++                .cloned()
++                .collect();
++            assert_eq!(all_keys(&db, &key(1, b"12")).await, sub, "size {size}");
++
++            // Seeks: within the current segment, across segments, and past the end.
++            let mut cursor = KeyCursor::scan_prefix(db.as_ref(), &[1]).await.unwrap();
++            cursor.seek(&key(1, b"005")).await.unwrap();
++            assert_eq!(cursor.next().await.unwrap().unwrap(), key(1, b"005"));
++            cursor.seek(&key(1, b"0055")).await.unwrap();
++            assert_eq!(cursor.next().await.unwrap().unwrap(), key(1, b"006"));
++            cursor.seek(&key(1, b"250")).await.unwrap();
++            assert_eq!(cursor.peek().unwrap(), &key(1, b"250"));
++            cursor.seek(&key(1, b"299")).await.unwrap();
++            assert_eq!(cursor.next().await.unwrap().unwrap(), key(1, b"299"));
++            assert_eq!(cursor.next().await.unwrap(), None);
++            cursor.seek(&key(1, b"300")).await.unwrap();
++            assert_eq!(cursor.next().await.unwrap(), None);
++        }
++    }
++
++    #[tokio::test]
++    async fn plain_and_segmented_entries_mix_in_one_index() {
++        let slate = in_memory_slate().await;
++        let db = slate.db.clone();
++        let first: Vec<Vec<u8>> = (0..20u32)
++            .map(|i| key(2, &format!("{i:02}").into_bytes()))
++            .collect();
++        let mut batch = WriteBatch::new();
++        write_segmented(db.as_ref(), &mut batch, first.clone(), 1)
++            .await
++            .unwrap();
++        db.write_with_options(batch, &DEFAULT_WRITE_OPTIONS)
++            .await
++            .unwrap();
++        let second: Vec<Vec<u8>> = (0..20u32)
++            .map(|i| key(2, &format!("{i:02}x").into_bytes()))
++            .collect();
++        let mut batch = WriteBatch::new();
++        write_segmented(db.as_ref(), &mut batch, second.clone(), 8)
++            .await
++            .unwrap();
++        db.write_with_options(batch, &DEFAULT_WRITE_OPTIONS)
++            .await
++            .unwrap();
++
++        let mut expected = first;
++        expected.extend(second);
++        expected.sort();
++        assert_eq!(all_keys(&db, &[2]).await, expected);
++    }
++
++    mod equivalence {
++        use edn::kw;
++        use edn::Keyword;
++
++        use crate::ops::{DataType, EntityRef, TxOp};
++        use crate::{Database, Node, QueryNode, SubmitNode, TransactionResult, TxKey};
++
++        fn attr(ident: Keyword, value_type: &str, cardinality: &str, unique: bool) -> TxOp {
++            let mut fields = vec![
++                (kw!(:db/ident), DataType::Keyword(ident)),
++                (
++                    kw!(:db/valueType),
++                    DataType::Keyword(Keyword::namespaced("db.type", value_type)),
++                ),
++                (
++                    kw!(:db/cardinality),
++                    DataType::Keyword(Keyword::namespaced("db.cardinality", cardinality)),
++                ),
++            ];
++            if unique {
++                fields.push((
++                    kw!(:db/unique),
++                    DataType::Keyword(Keyword::namespaced("db.unique", "identity")),
++                ));
++            }
++            TxOp::put(fields)
++        }
++
++        async fn commit(node: &Node<crate::memory_log::MemoryLog>, ops: Vec<TxOp>) -> TxKey {
++            match node.execute_tx(ops).await.unwrap() {
++                TransactionResult::TxCommitted(key) => key,
++                TransactionResult::TxAborted(_, err) => panic!("tx aborted: {err}"),
++            }
++        }
++
++        fn by_id(id: i64) -> EntityRef {
++            EntityRef::LookupRef(kw!(:g/id), DataType::Long(id))
++        }
++
++        const QUERIES: &[&str] = &[
++            "[:find ?a ?b ?c :where [?a :g/to ?b] [?b :g/to ?c] [?a :g/to ?c]]",
++            "[:find (count ?c) :where [?a :g/to ?b] [?b :g/to ?c]]",
++            "[:find ?a (count ?b) :where [?a :g/to ?b]]",
++            "[:find ?b (count ?a) :where [?a :g/to ?b]]",
++            "[:find ?b :where [?a :g/id 7] [?a :g/to ?b]]",
++            "[:find ?e :where [?e :g/weight ?w] [(> ?w 40)]]",
++            "[:find (sum ?w) :where [?e :g/weight ?w]]",
++            "[:find ?a ?b :where [?a :g/to ?b] [?b :g/weight ?w] [(> ?w 30)]]",
++            "[:find ?e :where [?e :g/label \"label-13\"]]",
++            "[:find ?e ?l ?w :where [?e :g/label ?l] [?e :g/weight ?w]]",
++            "[:find ?id ?w :where [?e :g/id ?id] [?e :g/weight ?w] [?e :g/to ?o] [?o :g/id 3]]",
++        ];
++
++        /// Load a small graph with retractions and card-one updates, then answer every
++        /// query at the current basis and at an earlier one.
++        async fn run(segment_size: usize) -> (Vec<Vec<Vec<DataType>>>, u64) {
++            let node = Node::memory_node().await;
++            node.set_segment_size(segment_size).await;
++            commit(
++                &node,
++                vec![
++                    attr(kw!(:g/id), "long", "one", true),
++                    attr(kw!(:g/to), "ref", "many", false),
++                    attr(kw!(:g/label), "string", "one", false),
++                    attr(kw!(:g/weight), "long", "one", false),
++                ],
++            )
++            .await;
++
++            let n = 60i64;
++            let vertices: Vec<TxOp> = (0..n)
++                .map(|i| {
++                    TxOp::put([
++                        (kw!(:g/id), DataType::Long(i)),
++                        (kw!(:g/label), DataType::String(format!("label-{i}"))),
++                        (kw!(:g/weight), DataType::Long(i % 50)),
++                    ])
++                })
++                .collect();
++            for chunk in vertices.chunks(23) {
++                commit(&node, chunk.to_vec()).await;
++            }
++            let edges: Vec<TxOp> = (0..n)
++                .flat_map(|i| {
++                    [1, 7, 11, 13]
++                        .into_iter()
++                        .map(move |k| (i, (i * k + 3) % n))
++                        .filter(|(a, b)| a != b)
++                })
++                .map(|(a, b)| TxOp::Add {
++                    entity: by_id(a),
++                    attribute: kw!(:g/to),
++                    value: DataType::Long(0), // replaced below
++                })
++                .collect::<Vec<_>>();
++            // Ref values need entity ids: look them up once.
++            let db = node.db().await.unwrap();
++            let rows = db
++                .query("[:find ?id ?e :where [?e :g/id ?id]]")
++                .await
++                .unwrap();
++            let mut eid = vec![0i64; n as usize];
++            for row in rows {
++                let [DataType::Long(id), DataType::Long(e)] = row.as_slice() else {
++                    panic!("unexpected row {row:?}");
++                };
++                eid[*id as usize] = *e;
++            }
++            let edges: Vec<TxOp> = edges
++                .into_iter()
++                .zip((0..n).flat_map(|i| {
++                    [1, 7, 11, 13]
++                        .into_iter()
++                        .map(move |k| (i, (i * k + 3) % n))
++                        .filter(|(a, b)| a != b)
++                }))
++                .map(|(op, (_, b))| match op {
++                    TxOp::Add {
++                        entity, attribute, ..
++                    } => TxOp::Add {
++                        entity,
++                        attribute,
++                        value: DataType::Long(eid[b as usize]),
++                    },
++                    other => other,
++                })
++                .collect();
++            for chunk in edges.chunks(41) {
++                commit(&node, chunk.to_vec()).await;
++            }
++            let before_changes = commit(
++                &node,
++                vec![TxOp::Add {
++                    entity: by_id(5),
++                    attribute: kw!(:g/to),
++                    value: DataType::Long(eid[6]),
++                }],
++            )
++            .await;
++
++            // Retract some edges, bump weights (card-one auto retract), drop an entity.
++            let mut changes = Vec::new();
++            for i in (0..n).step_by(9) {
++                changes.push(TxOp::Retract {
++                    entity: by_id(i),
++                    attribute: kw!(:g/to),
++                    value: DataType::Long(eid[((i * 7 + 3) % n) as usize]),
++                });
++                changes.push(TxOp::Add {
++                    entity: by_id(i),
++                    attribute: kw!(:g/weight),
++                    value: DataType::Long(45 + i),
++                });
++            }
++            changes.push(TxOp::RetractEntity(by_id(17)));
++            commit(&node, changes).await;
++            commit(
++                &node,
++                vec![TxOp::Add {
++                    entity: by_id(2),
++                    attribute: kw!(:g/to),
++                    value: DataType::Long(eid[3]),
++                }],
++            )
++            .await;
++
++            let db = node.db().await.unwrap();
++            let db_before = node.db_as_of(before_changes).await.unwrap();
++            let mut results = Vec::new();
++            for q in QUERIES {
++                let mut rows = db.query(*q).await.unwrap();
++                rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
++                results.push(rows);
++                let mut rows = db_before.query(*q).await.unwrap();
++                rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
++                results.push(rows);
++            }
++            let keys = node
++                .index_storage()
++                .await
++                .unwrap()
++                .iter()
++                .map(|s| s.keys)
++                .sum();
++            node.close().await.unwrap();
++            (results, keys)
++        }
++
++        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++        async fn query_results_are_identical_across_segment_sizes() {
++            let (plain, plain_keys) = run(1).await;
++            assert!(plain.iter().all(|rows| !rows.is_empty()), "empty result");
++            for size in [3usize, 16, 256] {
++                let (segmented, keys) = run(size).await;
++                assert_eq!(segmented.len(), plain.len());
++                for (i, (a, b)) in plain.iter().zip(&segmented).enumerate() {
++                    assert_eq!(
++                        a,
++                        b,
++                        "segment size {size}: query {} differs",
++                        QUERIES[i / 2]
++                    );
++                }
++                assert!(
++                    keys < plain_keys,
++                    "segment size {size} should use fewer keys: {keys} vs {plain_keys}"
++                );
++            }
++        }
++    }
++}
+diff --git a/src/tempids.rs b/src/tempids.rs
+index e0cbc3c..dd395f7 100644
+--- a/src/tempids.rs
++++ b/src/tempids.rs
+@@ -205,7 +205,9 @@ mod tests {
+ 
+     async fn seed_datom(db: &slatedb::Db, schema: &Schema, datom: Datom) {
+         let mut batch = WriteBatch::new();
+-        write_index_entries(&mut batch, &[datom], schema, 1).unwrap();
++        write_index_entries(db, &mut batch, &[datom], schema, 1, 1)
++            .await
++            .unwrap();
+         db.write_with_options(batch, &DEFAULT_WRITE_OPTIONS)
+             .await
+             .unwrap();
+diff --git a/src/tx.rs b/src/tx.rs
+index 41d4914..1cce48f 100644
+--- a/src/tx.rs
++++ b/src/tx.rs
+@@ -15,7 +15,7 @@ use crate::metadata::PartitionMap;
+ use crate::ops::{DataType, Datom, DatomOp, Entid, EntityRef, TxOp};
+ use crate::partition::{extract_partition, DB_PARTITION, TX_PARTITION};
+ use crate::schema::{Schema, Unique, ValueType, DB_TX_ABORTED, DB_TX_COMMITTED};
+-use crate::slate::DEFAULT_SCAN_OPTIONS;
++use crate::segment::KeyCursor;
+ use crate::transaction::TxKey;
+ use crate::util::{concat_bytes, next_prefix};
+ 
+@@ -628,12 +628,10 @@ where
+         &encode_i64_bytes(crate::schema::DB_TX_ID),
+         &value_buf,
+     ]);
+-    let mut iter = sdb
+-        .scan_prefix_with_options(&ave_prefix, .., &DEFAULT_SCAN_OPTIONS)
+-        .await?;
++    let mut iter = KeyCursor::scan_prefix(sdb, &ave_prefix).await?;
+     let mut tx_eid: Option<i64> = None;
+-    while let Some(kv) = iter.next().await? {
+-        let (_attribute, _value, entity, _tx_eid, op) = ave_key_to_parts(kv.key)?;
++    while let Some(key) = iter.next().await? {
++        let (_attribute, _value, entity, _tx_eid, op) = ave_key_to_parts(key)?;
+         if op == codec::RETRACT {
+             continue;
+         }
+@@ -652,13 +650,11 @@ where
+     let mut entity_buf = Vec::new();
+     encode_datatype(&DataType::Long(tx_eid), &mut entity_buf);
+     let eav_prefix = concat_bytes(&[&[codec::EAV], &entity_buf]);
+-    let mut iter = sdb
+-        .scan_prefix_with_options(&eav_prefix, .., &DEFAULT_SCAN_OPTIONS)
+-        .await?;
++    let mut iter = KeyCursor::scan_prefix(sdb, &eav_prefix).await?;
+     let mut tx_result: Option<i64> = None;
+     let mut tx_error: Option<String> = None;
+-    while let Some(kv) = iter.next().await? {
+-        let (_entity, attribute, value, _tx_eid, op) = eav_key_to_parts(kv.key)?;
++    while let Some(key) = iter.next().await? {
++        let (_entity, attribute, value, _tx_eid, op) = eav_key_to_parts(key)?;
+         if op == codec::RETRACT {
+             continue;
+         }
+-- 
+2.51.2
+

@@ -1,0 +1,96 @@
+From 38f8af41507ba68a166500444f9485504dd921d9 Mon Sep 17 00:00:00 2001
+From: Ben Lovell <ben.j.lovell@gmail.com>
+Date: Thu, 3 Sep 2026 19:56:14 +0200
+Subject: [PATCH 09/36] wip(columnar-storage): fix AE/AV first-only segment
+ comparison; equivalence test passes
+
+---
+ PROGRESS.md                | 29 +++++++++++++++++------------
+ src/segment.rs             |  4 +++-
+ src/segment_layout_test.rs |  5 +++--
+ 3 files changed, 23 insertions(+), 15 deletions(-)
+
+diff --git a/PROGRESS.md b/PROGRESS.md
+index d3d5422..009f053 100644
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -3,20 +3,25 @@
+ ## Goal
+ Pack runs of sorted datoms for one attribute into one SlateDB key (keyed by the last datom key so forward seek lands on the right segment) with column-wise encoding: first/second component, op bitmap, tx column; FOR + bit-packing for integer columns, offsets+bytes otherwise. Column-only reads for AE/AV-style scans. Toggle: layout switch (see src/segment.rs and how bootstrap/node pass a layout). Ingest may be slow but must be correct. Temporal filtering must work via the tx column.
+ 
+-## Status (as of hand-off)
+-- Compiles (cargo check --all-targets clean).
+-- New: src/segment.rs (format, encode/decode, segmentation rules in module doc), src/iterator/segment_iterator.rs (ScanMode Pair/First, temporal version resolution per logical key).
+-- Modified: bootstrap.rs (init_db_with_layout), db_value.rs, indexer.rs (write path), iterator/mod.rs, lib.rs, node.rs, query/patterns/triple.rs, tx.rs (lookup_tx_completion takes a layout).
+-- Toggle verified plumbed end to end: `SegmentLayout::from_env()` is read in bootstrap, indexer, node, db_value; the query engine picks SegmentIterator in query/patterns/triple.rs:148. Only tx.rs lookup_tx_completion reads AEV/AVE outside the query engine and it is layout-aware.
+-- Added src/segment_layout_test.rs: row-vs-columnar equivalence over 9 queries (current + as-of), plus a per-index key/byte/datom-count storage report.
+-- NOTE: the machine disk hit 100%. Freed this worktree's target/{debug,release}/incremental. Build with CARGO_INCREMENTAL=0 and keep an eye on `df -h`.
++## Status
++
++- Compiles clean. Toggle plumbed end to end via `SegmentLayout::from_env()` (`TRIPLOX_SEGMENT_LAYOUT=columnar`, `TRIPLOX_SEGMENT_SIZE`): bootstrap.rs, indexer.rs, node.rs, db_value.rs all read it; the query engine picks `SegmentIterator` in src/query/patterns/triple.rs:148. Only `tx::lookup_tx_completion` reads AEV/AVE outside the query engine and it is layout-aware.
++- src/segment_layout_test.rs: row-vs-columnar equivalence over 9 queries (current DB and as-of a pre-retraction tx) plus a per-index key/byte/datom-count storage report. **PASSES.**
++- Fixed a real bug: `Segment::decode_first_column` left the second column with one offset, so any AE/AV `lower_bound`/`cmp_key` panicked (index out of bounds). Now n+1 zero offsets so second reads as empty.
++- Equivalence-test storage report (30 vertices, ~87 edges, segment_size 64):
++  row: 1165 keys, 36289 bytes total. columnar: 335 keys, 16421 bytes total (-55%). AEV datoms 247 == 247.
++
++### Disk hazard (read this)
++The machine disk hit 100% repeatedly; five agents build concurrently. Two things matter:
++- Build with debug info off, which cuts this worktree's target from ~3.2G to ~1.6G:
++  `export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=off CARGO_PROFILE_BENCH_DEBUG=0`
++- When bash tool calls fail with ENOSPC the command does not run at all. Check `df -h /System/Volumes/Data` first.
++`target/debug` and `target/release` were deleted once each to make room (no `cargo clean`).
+ 
+ ## Next
+-1. Run the equivalence test (cargo test -p triplox --lib segment_layout -- --nocapture) and record the storage report.
+-2. Equivalence test across layouts on a small graph (include an as-of query).
+-3. cargo test -p triplox, clippy.
+-4. A/B bench; report SlateDB key count and bytes per index before/after and ingest_ms.
+-5. EXPERIMENT.md, fmt, commit.
++1. Full `cargo test -p triplox` + `cargo clippy -p triplox --all-targets`.
++2. Interleaved A/B bench, 3 runs each, JSON to results/columnar-storage-{off,on}.json.
++3. EXPERIMENT.md, fmt, commit.
+ 
+ ## Shared context
+ 
+diff --git a/src/segment.rs b/src/segment.rs
+index b8f656e..024e1a9 100644
+--- a/src/segment.rs
++++ b/src/segment.rs
+@@ -380,8 +380,10 @@ impl Segment {
+         Ok(Segment {
+             index,
+             first: Column::decode(first, n)?,
++            // n+1 zero offsets: every second entry reads as empty, so key
++            // comparisons see only the first column.
+             second: Column::Raw {
+-                offsets: vec![0],
++                offsets: vec![0; n + 1],
+                 bytes: Vec::new(),
+             },
+             ops: ops.to_vec(),
+diff --git a/src/segment_layout_test.rs b/src/segment_layout_test.rs
+index e975cf1..be5ccda 100644
+--- a/src/segment_layout_test.rs
++++ b/src/segment_layout_test.rs
+@@ -10,7 +10,8 @@ use crate::ops::{DataType, EntityRef, TxOp};
+ use crate::segment::{Segment, SegmentLayout};
+ use crate::slate::DEFAULT_SCAN_OPTIONS;
+ use crate::transaction::TxKey;
+-use triplox_client::node::{Database, QueryNode, SubmitNode, TransactionResult};
++use triplox_client::node::{Database, QueryNode, SubmitNode};
++use triplox_client::transaction::TransactionResult;
+ 
+ const QUERIES: &[&str] = &[
+     "[:find ?a ?b :where [?a :g/to ?b]]",
+@@ -132,7 +133,7 @@ async fn results(node: &Node<MemoryLog>, as_of: Option<TxKey>) -> Vec<Vec<Vec<Da
+     let mut all = Vec::new();
+     for q in QUERIES {
+         let mut rows = db.query(*q).await.unwrap_or_else(|e| panic!("{q}: {e}"));
+-        rows.sort();
++        rows.sort_by_key(|r| format!("{r:?}"));
+         all.push(rows);
+     }
+     all
+-- 
+2.51.2
+

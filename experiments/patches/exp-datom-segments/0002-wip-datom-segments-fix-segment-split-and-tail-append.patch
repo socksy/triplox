@@ -1,0 +1,167 @@
+From 7c46385701404f5e1a1e48f761f55074817fcdb4 Mon Sep 17 00:00:00 2001
+From: Ben Lovell <ben.j.lovell@gmail.com>
+Date: Thu, 3 Sep 2026 19:56:52 +0200
+Subject: [PATCH 2/7] wip(datom-segments): fix segment split and tail-append
+ write bugs
+
+---
+ PROGRESS.md    | 23 ++++++++-------
+ src/segment.rs | 79 +++++++++++++++++++++++++++-----------------------
+ 2 files changed, 56 insertions(+), 46 deletions(-)
+
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 8278c85..07242a8 100644
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -3,18 +3,21 @@
+ ## Goal
+ Datomic-style segments: up to N sorted datom keys under one key (keyed by the last datom key), per-datom encoding unchanged. Isolate the effect of key count / per-key LSM overhead. Toggle: TRIPLOX_SEGMENT_SIZE (1 = today's layout; measure 64, 256, 1024). Readers accept both layouts in one index. Point lookups, lookup refs, temporal filtering, CDC must keep working.
+ 
+-## Status (as of hand-off)
+-- Compiles (cargo check --all-targets clean). Previous agent reported "Build passes" after porting the three iterators onto a segment cursor.
+-- New: src/segment.rs (layout, configured_segment_size, cursor, write helpers).
+-- Modified: benches/datalog_bench.rs, bootstrap.rs, incremental/cdc.rs, indexer.rs, iterator/{slate_iterator,slate_key_iterator,temporal_filter_iterator}.rs, lib.rs, node.rs, query/patterns/triple.rs, tempids.rs, tx.rs.
+-- Previous agent's stated next steps: a public storage-stats hook for the bench (key count / bytes per index), the cross-size equivalence test, and bench output for storage numbers.
++## Status
++- Compiles clean. Storage-stats hook (`Node::index_storage`) and bench storage output are in.
++- Fixed two real write-path bugs in `write_segmented` (segment sizes 2 and 4 were losing/mis-ordering datoms):
++  1. Splitting eagerly mid-batch flushed a left half that a later key in the same batch still belonged to. Splitting now happens once, in `Pending::flush`, which chunks the merged run into `segment_size` pieces.
++  2. `seek` returning `None` was taken to mean "pending is the last segment"; untouched segments can sit between pending and the new key, so appending produced overlapping datom ranges. The tail owner is now looked up with a descending scan and adopted if it is above pending.
++- `cargo test -p triplox --lib segment::` : the three layout tests pass for sizes 1/2/4/64 and mixed layouts.
++- Still failing: `segment::tests::equivalence::query_results_are_identical_across_segment_sizes` panics with "empty result" at segment size 1 (plain layout), i.e. the test's own graph fixture is wrong (its edge ops are built with a placeholder value and then zipped back together). Needs rewriting, it is not a segment bug.
+ 
+ ## Next
+-1. Run bench with TRIPLOX_SEGMENT_SIZE=256 and check row counts against baseline. Fix correctness first.
+-2. Storage-stats hook + bench output; equivalence test across sizes including an as-of query.
+-3. cargo test -p triplox (with default size 1 and with 256), clippy.
+-4. A/B bench (size 1 vs best size, 3 each alternating) plus one run at each other size.
+-5. EXPERIMENT.md (mention the 65 KiB key limit and CDC), fmt, commit.
++1. Rewrite the equivalence fixture's edge construction so every query returns rows; then check sizes 3/16/256 against size 1.
++2. cargo test -p triplox (default size 1, and with TRIPLOX_SEGMENT_SIZE=256), clippy.
++3. A/B bench interleaved (size 1 vs best size, 3 each) plus one run at each other size; row-count check vs baseline.
++4. EXPERIMENT.md (mention the 65 KiB key limit and CDC), fmt, commit.
++
++Machine note: the disk filled up (five concurrent cargo builds). `target/debug` in this worktree was deleted once to recover; `target/release` was kept. Set `CARGO_INCREMENTAL=0` to keep it smaller.
+ 
+ ## Shared context
+ 
+diff --git a/src/segment.rs b/src/segment.rs
+index 4599967..7a6a4bd 100644
+--- a/src/segment.rs
++++ b/src/segment.rs
+@@ -238,16 +238,24 @@ impl Pending {
+         }
+     }
+ 
+-    fn flush(self, batch: &mut WriteBatch) {
+-        let Some(last) = self.datoms.last() else {
++    /// Write the merged datoms back as segments of at most `segment_size`, keyed by the
++    /// last datom of each. Splitting happens here, once the run is complete, because a
++    /// key seen later in the same batch can still belong to an earlier part of the run.
++    fn flush(self, batch: &mut WriteBatch, segment_size: usize) {
++        if self.datoms.is_empty() {
+             return;
+-        };
++        }
++        let mut orig_rewritten = false;
++        for chunk in self.datoms.chunks(segment_size) {
++            let last = chunk.last().expect("non-empty chunk");
++            orig_rewritten |= self.orig_key.as_ref() == Some(last);
++            batch.put(last, encode_segment(chunk));
++        }
+         if let Some(orig) = &self.orig_key {
+-            if orig != last {
++            if !orig_rewritten {
+                 batch.delete(orig);
+             }
+         }
+-        batch.put(last, encode_segment(&self.datoms));
+     }
+ }
+ 
+@@ -288,7 +296,7 @@ where
+                 match iter.next().await? {
+                     Some(kv) => {
+                         if let Some(p) = pending.take() {
+-                            p.flush(batch);
++                            p.flush(batch, segment_size);
+                         }
+                         pending = Some(Pending {
+                             datoms: decode_segment(&kv.key, &kv.value)?,
+@@ -296,44 +304,43 @@ where
+                         });
+                     }
+                     None => {
++                        // Nothing at or above `key`, so `key` extends the last segment of
++                        // the index. That is not necessarily `pending`: untouched segments
++                        // can sit between them, and appending to `pending` would make two
++                        // segments cover overlapping datom ranges.
+                         at_tail = true;
+-                        if pending.is_none() {
+-                            let mut last = db
+-                                .scan_with_options(vec![index]..key.to_vec(), &descending)
+-                                .await?;
+-                            pending = Some(match last.next().await? {
+-                                Some(kv) => Pending {
+-                                    datoms: decode_segment(&kv.key, &kv.value)?,
+-                                    orig_key: Some(kv.key),
+-                                },
+-                                None => Pending {
+-                                    orig_key: None,
+-                                    datoms: Vec::new(),
+-                                },
++                        let mut last = db
++                            .scan_with_options(vec![index]..key.to_vec(), &descending)
++                            .await?;
++                        let tail = last.next().await?;
++                        let adopt = tail.as_ref().is_some_and(|kv| {
++                            pending
++                                .as_ref()
++                                .and_then(|p| p.orig_key.as_ref())
++                                .is_none_or(|orig| *orig < kv.key)
++                        });
++                        if adopt {
++                            let kv = tail.expect("adopted tail segment");
++                            if let Some(p) = pending.take() {
++                                p.flush(batch, segment_size);
++                            }
++                            pending = Some(Pending {
++                                datoms: decode_segment(&kv.key, &kv.value)?,
++                                orig_key: Some(kv.key),
++                            });
++                        } else if pending.is_none() {
++                            pending = Some(Pending {
++                                orig_key: None,
++                                datoms: Vec::new(),
+                             });
+                         }
+                     }
+                 }
+             }
+-            let p = pending.as_mut().expect("pending segment");
+-            p.insert(key);
+-            if p.datoms.len() > segment_size {
+-                // Appends at the tail leave a full segment behind; splits elsewhere halve.
+-                let split_at = if at_tail {
+-                    segment_size
+-                } else {
+-                    p.datoms.len() / 2
+-                };
+-                let left: Vec<Bytes> = p.datoms.drain(..split_at).collect();
+-                Pending {
+-                    orig_key: None,
+-                    datoms: left,
+-                }
+-                .flush(batch);
+-            }
++            pending.as_mut().expect("pending segment").insert(key);
+         }
+         if let Some(p) = pending.take() {
+-            p.flush(batch);
++            p.flush(batch, segment_size);
+         }
+     }
+     Ok(())
+-- 
+2.51.2
+

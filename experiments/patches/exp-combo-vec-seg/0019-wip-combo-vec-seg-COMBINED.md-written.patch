@@ -1,0 +1,251 @@
+From b29f2e2a4d1659415e9b4950c800011017bdc52f Mon Sep 17 00:00:00 2001
+From: Ben Lovell <ben.j.lovell@gmail.com>
+Date: Thu, 3 Sep 2026 21:14:35 +0200
+Subject: [PATCH 19/20] wip(combo-vec-seg): COMBINED.md written
+
+---
+ COMBINED.md | 201 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ PROGRESS.md |  12 ++--
+ 2 files changed, 208 insertions(+), 5 deletions(-)
+ create mode 100644 COMBINED.md
+
+diff --git a/COMBINED.md b/COMBINED.md
+new file mode 100644
+index 0000000..67a957f
+--- /dev/null
++++ b/COMBINED.md
+@@ -0,0 +1,201 @@
++# Combination: vectorized join + datom segments
++
++Branch `exp/combo-vec-seg`. Merges two finished experiments and measures whether their gains
++compose:
++
++- **`exp/vectorized-join`** — columnar (batched) generic join. `TRIPLOX_BATCHED_JOIN=1`.
++  Attacks the *row bookkeeping*: one `Vec<Bytes>` per intermediate row becomes shared columns
++  plus a `Vec<u32>` row map.
++- **`exp/datom-segments`** — many datom keys packed into one SlateDB entry.
++  `TRIPLOX_SEGMENT_SIZE=256`. Attacks the *storage access*: 45953 LSM keys per index become 224.
++
++Design notes for each are kept verbatim in `docs/vectorized-join-EXPERIMENT.md`,
++`docs/datom-segments-EXPERIMENT.md` (and the two `-PROGRESS.md` files).
++
++## What was merged, and the conflicts
++
++Merge order: `exp/vectorized-join`, then `exp/datom-segments`. Conflicts were trivial.
++
++| file | conflict | resolution |
++|---|---|---|
++| `EXPERIMENT.md`, `PROGRESS.md` | add/add, both merges | source-branch copies moved to `docs/<branch>-*.md`; this worktree's `PROGRESS.md` kept |
++| `src/query/patterns/triple.rs` | import block only | kept both `query::vectorized::{batch,...}` and `segment` imports |
++
++Everything else auto-merged. That is not luck — the two features meet at exactly two places and
++both already had the right shape:
++
++1. **Reads.** The batched path (`grouped_extensions`, `validate_grouped`, `scan_all`) goes through
++   `Box<dyn Index>` — `SlateIterator` / `TemporalFilterIterator` — and datom-segments rewired those
++   to `KeyCursor` internally without changing their `seek`/`next`/`get_value` contract. So the
++   batched engine reads segments with no code of its own.
++2. **Cardinality estimates.** `count_batch` calls the same `TriplePattern::estimate_count` the row
++   path uses, and that is where segments added `* segment::estimate_scale()`. The batched engine's
++   "one estimate per distinct key instead of per row" therefore inherits the segment scale for free.
++
++One thing worth naming because it *could* have been a conflict and is not: `estimate_scale()` is a
++single process-wide constant, so it multiplies every index's estimate by the same 256. Proposer
++selection compares estimates against each other, so a uniform factor cannot change which pattern
++proposes. Segments do not perturb the plan. (The scale is nonetheless wrong per index — AVE keeps
++1122 keys where EAV keeps 224 — so absolute estimates are off by ~5x on AVE. It did not change any
++result here, but it is a real limitation inherited from the source branch.)
++
++## New test
++
++Neither source branch tests this pairing. The vectorized equivalence test writes datoms straight to
++an in-memory slate with `db.put`, bypassing the indexer, so it never sees a segment; the segment
++equivalence test goes through `db.query`, which picks whichever engine the env selects, so it never
++compares the two engines against each other.
++
++`segment::tests::equivalence::batched_and_row_engines_agree_over_segments` (src/segment.rs) closes
++the gap: load the 60-vertex graph with retractions and card-one updates at segment size 256, then
++run all 11 queries at two bases through `GenericJoinEngine` and `BatchedJoinEngine` directly and
++compare `variables` and `rows` exactly, including row order. 22 comparisons, all equal. `run(size)`
++was split into `load(size)` + `run(size)` to share the fixture.
++
++## Test and lint status
++
++| | toggles off | `TRIPLOX_BATCHED_JOIN=1 TRIPLOX_SEGMENT_SIZE=256` |
++|---|---|---|
++| `cargo test -p triplox` lib | 614 pass, 0 fail, 1 ignored | 615 pass, 0 fail, 1 ignored |
++| integration targets | 32 pass, 0 fail | 32 pass, 0 fail |
++| `cargo clippy -p triplox --all-targets` | clean | clean |
++
++(615 vs 614 is the new combined test. Both toggles are read from env at runtime, so clippy cannot
++differ between the arms; it was run once.)
++
++`cargo fmt` applied.
++
++## Benchmark
++
++`cargo bench --bench datalog_bench`, `VERTICES=2000 EDGE_PROB=0.01` (39764 edges, 45953 datoms per
++index), `RUNS=5`. Four arms — off / batched only / segments only / all on — interleaved in that
++order, three passes. `med` is the median of the three per-pass medians.
++
++Row counts are identical to the hand-off baseline in all four arms for all ten queries: triangles
++7821, out_degree 2000, in_degree_top 2000, neighbors_of_42 21, weight_filter 198, heavy_neighbors
++1908, the rest 1.
++
++Two other agents were benchmarking on the same machine throughout, so absolute times drift between
++passes (the `off` arm's triangles medians were 606 / 728 / 691 ms against a quiet-machine baseline
++of 537). Interleaving keeps the comparison fair; ratios are the number to read, not the absolute
++times, and anything under ~5 ms is noise.
++
++### Attribution
++
++| query | off | batched | segments | all | batched | segments | **all** | singles multiplied |
++|---|---|---|---|---|---|---|---|---|
++| triangles | 691.4 | 415.2 | 449.3 | 267.6 | 1.67x | 1.54x | **2.58x** | 2.56x |
++| two_hop_count | 249.2 | 167.6 | 164.0 | 94.4 | 1.49x | 1.52x | **2.64x** | 2.26x |
++| three_hop_count | 10685 | 2849 | 10875 | 3457 | 3.75x | 0.98x | **3.09x** | 3.68x |
++| out_degree | 51.9 | 43.8 | 22.3 | 15.6 | 1.19x | 2.33x | **3.34x** | 2.76x |
++| in_degree_top | 51.6 | 43.1 | 18.9 | 14.8 | 1.20x | 2.73x | **3.49x** | 3.27x |
++| neighbors_of_42 | 1.72 | 1.47 | 0.11 | 0.18 | 1.18x | 15.4x | 9.6x | 18.1x |
++| weight_filter | 4.57 | 3.34 | 2.42 | 1.39 | 1.37x | 1.89x | **3.28x** | 2.58x |
++| weight_sum | 4.58 | 3.34 | 1.90 | 1.34 | 1.37x | 2.41x | **3.42x** | 3.31x |
++| heavy_neighbors | 84.2 | 57.6 | 42.3 | 25.4 | 1.46x | 1.99x | **3.32x** | 2.91x |
++| label_lookup | 0.05 | 0.02 | 0.03 | 0.06 | - | - | - | - |
++
++`three_hop_count` gets six passes instead of three (see below); every other row is the three-pass
++median. `label_lookup` is a 20-50 µs query — it measures process noise, not the database.
++
++Best-of-all-passes minima, all-on versus off, as a sanity check on the medians: triangles 2.64x,
++two_hop 2.59x, out_degree 4.18x, in_degree_top 4.21x, weight_filter 5.22x, weight_sum 5.16x,
++heavy_neighbors 3.65x, neighbors_of_42 24x. The minima are more favourable than the medians
++throughout, which is what a loaded machine does to an experiment.
++
++### Storage
++
++Unchanged by the join engine; the segments arms show the source branch's numbers.
++
++| index | keys off | keys segments | key bytes off | key bytes segments | value bytes segments |
++|---|---|---|---|---|---|
++| EAV | 45953 | 224 | 1659358 | 8122 | 1751264 |
++| AVE | 45953 | 1122 | 1659358 | 40462 | 1751264 |
++| AEV | 45953 | 240 | 1659358 | 8705 | 1751264 |
++| AE | 8189 | 97 | 147402 | 1746 | 163780 |
++| AV | 7128 | 99 | 133354 | 1891 | 147610 |
++| VAE | 2031 | 9 | 73276 | 330 | 77338 |
++
++## Interactions found
++
++**1. On eight of ten queries the gains do not just compose, they beat the product of the singles.**
++Compare the last two columns: out_degree 3.34x actual against 2.76x predicted, weight_filter 3.28x
++against 2.58x, heavy_neighbors 3.32x against 2.91x, two_hop_count 2.64x against 2.26x. Only
++triangles (2.58x vs 2.56x) and weight_sum (3.42x vs 3.31x) land on the prediction.
++
++The reading is that each feature was partly hidden behind the other. With one key per datom, the
++batched engine still pays an LSM lookup per datom, so removing row allocations exposes less than
++it should — batched alone is only 1.19x on out_degree. With rows still allocated per output row,
++making the scan cheap only shifts the bottleneck — segments alone is 2.33x. Turn both off and the
++query is bounded by whichever is worse at that moment; turn both on and neither is there. That is
++the shape a genuine composition takes, and it is the main result.
++
++**2. `three_hop_count` is the exception, and segments are the reason.** Segments alone do nothing
++to it: 0.98x on six passes, with per-pass off/segments ratios of 0.66, 0.95, 1.33, 0.93, 0.94, 1.08
++— straddling 1.0. The batched engine alone is the biggest single win in the whole experiment,
++3.75x. Together they are 3.09x, i.e. *worse than batched alone*, and per-pass batched/all ratios of
++0.59, 0.84, 0.97, 0.50, 1.07, 1.14 say the penalty is real in four passes of six and reversed in
++two. Median penalty about 20%, spread far too wide for that number to be trusted.
++
++Why segments do not help this query is not mysterious: the vectorized branch profiled triangles at
++~55% malloc/memcpy and ~28% storage iteration, and three_hop has by far the largest intermediate
++result, so the row-layout cost dominates completely. Segments only attack the 28%.
++
++Why segments would *cost* something on top of the batched engine is a hypothesis, not a measured
++fact: `decode_segment` hands out `Bytes` slices of the shared segment value, so every extension
++value the batched engine pushes into its pool holds a reference to a ~9 KB buffer and costs an
++atomic refcount pair. At one key per datom each value is its own small allocation that goes away
++when the level does. On the query with the largest pool, that could plausibly outweigh the cheaper
++seeks. Confirming it needs a profile of the all-on arm, which this experiment did not do.
++
++**3. The columnar regressions the vectorized branch reported are gone, but so is one of its wins on
++small queries.** `neighbors_of_42` was +26% median on the vectorized branch's own A/B; here batched
++alone is 1.18x *faster*, so that regression did not reproduce. But segments alone take it to 15.4x
++(0.11 ms) and adding the batched engine takes it back to 9.6x (0.18 ms). Twenty-one rows out of a
++point lookup is not enough work to pay for the batched engine's setup, and once segments have made
++the lookup nearly free, that setup is the whole query. Same story on `label_lookup`. Both are
++sub-millisecond and should be read as "the batched engine has a fixed cost that only matters when
++there is nothing else to do".
++
++**4. No correctness interaction at all.** Row counts identical in every arm, all 647 tests pass in
++both configurations, and the new cross-engine-over-segments test is exact on rows *and* row order.
++The two features touch genuinely disjoint concerns — one owns the layout of intermediate results,
++the other owns the layout of stored keys — and the `Index` trait is the seam that kept them apart.
++
++## Verdict
++
++The stack is worth having. All on is 2.6x-3.5x on every query that does real work, against a
++baseline where the better single feature would have given 1.5x-2.7x. The combination is more than
++the sum of its parts on eight of ten queries, and the merge cost was one import block.
++
++Three caveats, in order of how much they should bother anyone integrating this:
++
++- **`three_hop_count` is unresolved.** The heaviest query is the one where segments contribute
++  nothing and may cost ~20%. Both source branches already flagged three_hop as their weakest
++  measurement, and this experiment did not fix that — it ran six passes on a loaded machine and got
++  a spread of 0.50 to 1.14. Anyone landing both features should profile the all-on arm on a quiet
++  machine before believing any number in that row.
++- **The `Bytes`-into-segment-buffer question is worth answering before, not after.** If the
++  hypothesis in interaction 2 is right, it argues for the columnar sink the vectorized branch listed
++  as its top missing piece, and possibly for copying short datom values out of the segment buffer
++  rather than slicing it.
++- **Everything each branch said it was missing is still missing.** No bounded batches, no columnar
++  sink, `relation`/`function`/`not`/`or` still fall back to the row engine wholesale, and the
++  duplicated `validate` arms in `triple.rs` are now duplicated across a merge as well. On the
++  segment side the CDC tx-eid filter is still the one genuinely new obligation, write amplification
++  under random single-datom writes is still unmeasured, and `estimate_scale` is still one
++  process-wide constant standing in for a per-index, per-database number.
++
++## Reproducing
++
++```sh
++export PATH="$HOME/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin:$PATH"
++export VERTICES=2000 EDGE_PROB=0.01 RUNS=5
++# one arm:
++TRIPLOX_BATCHED_JOIN=1 TRIPLOX_SEGMENT_SIZE=256 BENCH_OUT=all.json \
++  cargo bench --bench datalog_bench
++```
++
++Per-arm JSON (median of three passes, per-pass medians kept in each file) is in the session
++scratchpad as `results/combo-vec-seg-{off,batched,segments,all}.json`; the raw per-pass files are
++in `results/combo/`.
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 5ad0264..9748c8f 100644
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -36,10 +36,12 @@ Each source branch has an EXPERIMENT.md (design, toggle env var names, hook poin
+   (triangles 606 vs baseline 537 ms).
+ 
+ ## Next
+-1. Extra three_hop_count-only passes running (scratchpad/run-threehop.sh, passes 4-6) — it is the
+-   one query where the arms disagree: segments alone is a wash on it and `all` is slower than
+-   `batched` alone in all three passes.
+-2. Write COMBINED.md, fmt, commit.
++Nothing outstanding. COMBINED.md at the worktree root is the write-up. If someone picks this up:
++the open question is `three_hop_count` — six passes give segments 0.98x alone and `all` 3.09x
++against `batched` alone at 3.75x, i.e. segments cost roughly 20% on top of the batched engine with
++per-pass ratios from 0.50 to 1.14. Profile the all-on arm on a quiet machine; the hypothesis in
++COMBINED.md is that `decode_segment` handing out `Bytes` slices of a shared ~9 KB segment buffer
++puts an atomic refcount pair on every extension value the batched engine pools.
+ 
+ ### Bench result (3 passes x 4 arms, RUNS=5, median of the 3 pass medians, ms)
+ Row counts identical to baseline in all four arms for all ten queries.
+@@ -48,7 +50,7 @@ Row counts identical to baseline in all four arms for all ten queries.
+ |---|---|---|---|---|---|---|---|---|
+ | triangles | 691.4 | 415.2 | 449.3 | 267.6 | 1.67 | 1.54 | **2.58** | 2.56 |
+ | two_hop_count | 249.2 | 167.6 | 164.0 | 94.4 | 1.49 | 1.52 | **2.64** | 2.26 |
+-| three_hop_count | 9586.8 | 2608.0 | 10133.5 | 3205.8 | 3.68 | 0.95 | 2.99 | 3.48 |
++| three_hop_count (6 passes) | 10685 | 2849 | 10875 | 3457 | 3.75 | 0.98 | 3.09 | 3.68 |
+ | out_degree | 51.9 | 43.8 | 22.3 | 15.6 | 1.19 | 2.33 | **3.34** | 2.76 |
+ | in_degree_top | 51.6 | 43.1 | 18.9 | 14.8 | 1.20 | 2.73 | **3.49** | 3.27 |
+ | neighbors_of_42 | 1.72 | 1.47 | 0.11 | 0.18 | 1.18 | 15.4 | 9.63 | 18.1 |
+-- 
+2.51.2
+

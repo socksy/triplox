@@ -1,0 +1,1209 @@
+From d7eeaf12171a4b5d3f51e3855050d8f04753134b Mon Sep 17 00:00:00 2001
+From: Ben Lovell <ben.j.lovell@gmail.com>
+Date: Thu, 3 Sep 2026 19:39:15 +0200
+Subject: [PATCH 1/7] wip(zone-maps): recover in-progress experiment state and
+ add PROGRESS.md
+
+---
+ PROGRESS.md                              |  34 ++
+ benches/datalog_bench.rs                 |  58 ++-
+ src/db_value.rs                          |  31 ++
+ src/indexer.rs                           |   1 +
+ src/iterator/temporal_filter_iterator.rs |  35 +-
+ src/lib.rs                               |   1 +
+ src/node.rs                              |  10 +-
+ src/query/patterns/triple.rs             |  53 ++-
+ src/query/plan.rs                        | 109 +++++-
+ src/query/test_support.rs                |   1 +
+ src/schema.rs                            |   1 +
+ src/slate/mod.rs                         |   5 +
+ src/zone_map.rs                          | 439 +++++++++++++++++++++++
+ 13 files changed, 753 insertions(+), 25 deletions(-)
+ create mode 100644 PROGRESS.md
+ create mode 100644 src/zone_map.rs
+
+diff --git a/PROGRESS.md b/PROGRESS.md
+new file mode 100644
+index 0000000..07e2b71
+--- /dev/null
++++ b/PROGRESS.md
+@@ -0,0 +1,34 @@
++# Experiment: zone maps for scan pruning and predicate pushdown
++
++## Goal
++Per-run (RUN_SIZE keys in key order) min/max of the non-prefix component (V for AEV, E for AVE) plus oldest/newest tx id, per (index, attribute), built in memory by scanning the prefix and cached per basis (sound for any basis <= build basis, see module doc). Planner pushes comparison predicates on a single-pattern variable into the scan as V bounds; iterators skip runs. Toggle: TRIPLOX_ZONE_MAPS=1. Also measure an as-of query at an early basis.
++
++## Status (as of hand-off)
++- Compiles (cargo check --all-targets clean).
++- New: src/zone_map.rs (ZoneMap build/cache, set_enabled, skip counters).
++- Modified: benches/datalog_bench.rs, db_value.rs, indexer.rs, iterator/temporal_filter_iterator.rs, lib.rs, node.rs, query/plan.rs, query/patterns/triple.rs, query/test_support.rs, schema.rs, slate/mod.rs (SlateComponents carries the maps).
++- Previous agent had just finished the plumbing edits (lib.rs, SlateComponents, DB, four call sites). Unknown whether predicate pushdown in plan.rs is complete or whether the iterator actually consults the map yet. Check by running weight_filter with the toggle on and reading the skip counters.
++
++## Next
++1. Verify pushdown and run-skipping work end to end (skip counters > 0 on weight_filter, rows still 198).
++2. Equivalence test on/off including >= vs > boundaries and an as-of query.
++3. cargo test -p triplox, clippy.
++4. A/B bench; report skipped runs per query; add an as-of query to your own runs.
++5. EXPERIMENT.md (include interaction with a future segment layout), fmt, commit.
++
++## Shared context
++
++Toolchain: every shell needs `export PATH="$HOME/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin:$PATH"` and `export CARGO_BUILD_JOBS=3`. Never run `cargo clean`. Work only in this worktree.
++
++Benchmark: `cargo bench --bench datalog_bench` (env VERTICES, EDGE_PROB, RUNS, BENCH_OUT). Baseline JSON: /private/tmp/claude-501/-Users-ben-code-triplox/2cc95019-6318-4527-8430-7ad4b12972b9/scratchpad/results/baseline.json. Baseline medians (ms): triangles 537 (7821 rows), two_hop_count 223, three_hop_count 7041, out_degree 44 (2000 rows), in_degree_top 44 (2000 rows), neighbors_of_42 1.1 (21 rows), weight_filter 3.7 (198 rows), weight_sum 3.6, heavy_neighbors 68 (1908 rows), label_lookup 0.02 (1 row).
++
++Definition of done:
++1. Feature behind an env toggle; results identical on/off (row counts match baseline; an on/off equivalence test on a small graph).
++2. `cargo test -p triplox` and `cargo clippy -p triplox --all-targets` pass, or failures are listed here honestly.
++3. A/B interleaved bench, 3 runs each; JSON written to /private/tmp/claude-501/-Users-ben-code-triplox/2cc95019-6318-4527-8430-7ad4b12972b9/scratchpad/results/zone-maps-off.json and /private/tmp/claude-501/-Users-ben-code-triplox/2cc95019-6318-4527-8430-7ad4b12972b9/scratchpad/results/zone-maps-on.json.
++4. EXPERIMENT.md at worktree root: what was built, hook points (file:line), A/B table, what failed, honest verdict and integration cost.
++5. `cargo fmt`; commit on this branch; do not push; no GitHub issues/PRs.
++
++## Progress protocol
++
++After every milestone (compiles, test passes, bench run, doc written): update the Status and Next sections below, then `git add -A && git commit -q -m "wip(zone-maps): <milestone>"`. Commit even if incomplete. This file is the hand-off; a fresh agent must be able to continue from it alone.
+diff --git a/benches/datalog_bench.rs b/benches/datalog_bench.rs
+index 98a2ef0..3df9f24 100644
+--- a/benches/datalog_bench.rs
++++ b/benches/datalog_bench.rs
+@@ -4,14 +4,17 @@
+ //!
+ //! Run: `cargo bench --bench datalog_bench`
+ //! Env: VERTICES (default 2000), EDGE_PROB (default 0.01), RUNS (default 5),
+-//!      BENCH_OUT (optional path for JSON results).
++//!      BENCH_OUT (optional path for JSON results), ASOF=1 to add as-of queries
++//!      at the basis after vertex ingest and half-way through edge ingest.
++//!      Zone map skip counters are printed when TRIPLOX_ZONE_MAPS=1.
+ 
+ use std::time::Instant;
+ 
+ use edn::kw;
+ use edn::Keyword;
+ use triplox::ops::{DataType, EntityRef, TxOp};
+-use triplox::{Database, Node, QueryNode, SubmitNode, TransactionResult};
++use triplox::{Database, Node, QueryNode, SubmitNode, TransactionResult, DB};
++use triplox_client::transaction::TxKey;
+ 
+ struct XorShift(u64);
+ 
+@@ -76,9 +79,9 @@ fn gnp_edges(n: i64, p: f64, seed: u64) -> Vec<(i64, i64)> {
+     edges
+ }
+ 
+-async fn commit(node: &impl SubmitNode, ops: Vec<TxOp>) {
++async fn commit(node: &impl SubmitNode, ops: Vec<TxOp>) -> TxKey {
+     match node.execute_tx(ops).await.expect("tx should execute") {
+-        TransactionResult::TxCommitted(_) => {}
++        TransactionResult::TxCommitted(tx_key) => tx_key,
+         TransactionResult::TxAborted(_, err) => panic!("tx aborted: {err}"),
+     }
+ }
+@@ -126,6 +129,7 @@ async fn main() {
+     let edge_prob: f64 = env_or("EDGE_PROB", 0.01);
+     let runs: usize = env_or("RUNS", 5);
+     let batch: usize = env_or("BATCH_SIZE", 1000);
++    let asof: bool = env_or("ASOF", 0u8) == 1;
+ 
+     let node = Node::memory_node().await;
+     commit(&node, schema()).await;
+@@ -140,9 +144,11 @@ async fn main() {
+             ])
+         })
+         .collect();
++    let mut basis_vertices = None;
+     for chunk in vertex_ops.chunks(batch) {
+-        commit(&node, chunk.to_vec()).await;
++        basis_vertices = Some(commit(&node, chunk.to_vec()).await);
+     }
++    let basis_vertices = basis_vertices.expect("at least one vertex chunk");
+ 
+     let db = node.db().await.expect("db");
+     let rows = db
+@@ -166,8 +172,13 @@ async fn main() {
+             value: DataType::Long(eid[*to as usize]),
+         })
+         .collect();
+-    for chunk in edge_ops.chunks(batch) {
+-        commit(&node, chunk.to_vec()).await;
++    let chunks: Vec<&[TxOp]> = edge_ops.chunks(batch).collect();
++    let mut basis_mid = basis_vertices;
++    for (index, chunk) in chunks.iter().enumerate() {
++        let tx_key = commit(&node, chunk.to_vec()).await;
++        if index + 1 == chunks.len() / 2 {
++            basis_mid = tx_key;
++        }
+     }
+     let ingest_ms = ingest_start.elapsed().as_secs_f64() * 1000.0;
+ 
+@@ -176,13 +187,27 @@ async fn main() {
+         edges.len()
+     );
+     println!(
+-        "{:<18} {:>10} {:>12} {:>12}",
+-        "query", "rows", "min_ms", "median_ms"
++        "{:<22} {:>10} {:>12} {:>12} {:>10} {:>10} {:>8}",
++        "query", "rows", "min_ms", "median_ms", "v_skips", "t_skips", "build_ms"
+     );
+ 
+     let db = node.db().await.expect("db");
++    let mut queries: Vec<(String, &str, DB)> = QUERIES
++        .iter()
++        .map(|(name, q)| (name.to_string(), *q, db.clone()))
++        .collect();
++    if asof {
++        let db_vertices = node.db_as_of(basis_vertices).await.expect("db as of");
++        let db_mid = node.db_as_of(basis_mid).await.expect("db as of mid");
++        let out_degree = "[:find ?a (count ?b) :where [?a :g/to ?b]]";
++        let two_hop = "[:find (count ?c) :where [?a :g/to ?b] [?b :g/to ?c]]";
++        queries.push(("asof_out_degree".into(), out_degree, db_vertices.clone()));
++        queries.push(("asof_two_hop_count".into(), two_hop, db_vertices));
++        queries.push(("asof_mid_out_degree".into(), out_degree, db_mid));
++    }
+     let mut json = Vec::new();
+-    for (name, q) in QUERIES {
++    triplox::zone_map::take_stats();
++    for (name, q, db) in &queries {
+         let mut times = Vec::with_capacity(runs);
+         let mut rows = 0;
+         for _ in 0..runs {
+@@ -194,9 +219,18 @@ async fn main() {
+         times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+         let min = times[0];
+         let median = times[times.len() / 2];
+-        println!("{name:<18} {rows:>10} {min:>12.2} {median:>12.2}");
++        // Skip counts are per execution; builds happen once and are reported as a total.
++        let stats = triplox::zone_map::take_stats();
++        let v_skips = stats.seeks_skipped / runs as u64;
++        let t_skips = stats.runs_skipped_t / runs as u64;
++        let build_ms = stats.build_micros as f64 / 1000.0;
++        println!(
++            "{name:<22} {rows:>10} {min:>12.2} {median:>12.2} {v_skips:>10} {t_skips:>10} {build_ms:>8.2}"
++        );
+         json.push(format!(
+-            "{{\"query\":\"{name}\",\"rows\":{rows},\"min_ms\":{min:.3},\"median_ms\":{median:.3}}}"
++            "{{\"query\":\"{name}\",\"rows\":{rows},\"min_ms\":{min:.3},\"median_ms\":{median:.3},\"v_skips\":{v_skips},\"v_checks\":{},\"t_skips\":{t_skips},\"builds\":{},\"build_ms\":{build_ms:.3}}}",
++            stats.seeks_checked / runs as u64,
++            stats.builds
+         ));
+     }
+ 
+diff --git a/src/db_value.rs b/src/db_value.rs
+index a9226b9..b4b88f9 100644
+--- a/src/db_value.rs
++++ b/src/db_value.rs
+@@ -8,6 +8,7 @@ use crate::ops::QueryArg;
+ use crate::partition::tx_eid_from_tx_id;
+ use crate::query::{execute_query, QueryResult};
+ use crate::schema::IdentMap;
++use crate::zone_map::{self, Component, ZoneMap, ZoneMapCache};
+ use triplox_client::node::{Database, IntoQuery};
+ use triplox_client::transaction::TxKey;
+ 
+@@ -21,6 +22,7 @@ where
+     handle: Handle,
+     tx_key: TxKey,
+     range_stats: Arc<slatedb_estimates::RangeStats<M>>,
++    zone_maps: Arc<ZoneMapCache>,
+ }
+ 
+ impl<D, M> Clone for DB<D, M>
+@@ -35,6 +37,7 @@ where
+             handle: self.handle.clone(),
+             tx_key: self.tx_key,
+             range_stats: Arc::clone(&self.range_stats),
++            zone_maps: Arc::clone(&self.zone_maps),
+         }
+     }
+ }
+@@ -51,6 +54,7 @@ where
+         handle: Handle,
+         tx_key: TxKey,
+         range_stats: Arc<slatedb_estimates::RangeStats<M>>,
++        zone_maps: Arc<ZoneMapCache>,
+     ) -> Self {
+         Self {
+             sdb,
+@@ -58,6 +62,7 @@ where
+             handle,
+             tx_key,
+             range_stats,
++            zone_maps,
+         }
+     }
+ 
+@@ -67,6 +72,7 @@ where
+         ident_map: IdentMap,
+         handle: Handle,
+         range_stats: Arc<slatedb_estimates::RangeStats<M>>,
++        zone_maps: Arc<ZoneMapCache>,
+     ) -> Result<Self, Error> {
+         let tx_key = latest_tx_key_from_sdb(sdb.as_ref()).await?;
+         Ok(Self {
+@@ -75,6 +81,7 @@ where
+             handle,
+             tx_key,
+             range_stats,
++            zone_maps,
+         })
+     }
+ 
+@@ -101,6 +108,30 @@ where
+     pub(crate) fn range_stats(&self) -> &Arc<slatedb_estimates::RangeStats<M>> {
+         &self.range_stats
+     }
++
++    /// Zone map for one `(index, attribute)` prefix, built on first use and reused
++    /// for any basis at or before the one it was built at. `None` when disabled or
++    /// when the index has no zone map component.
++    pub(crate) fn zone_map(
++        &self,
++        index: u8,
++        attribute: i64,
++    ) -> Result<Option<Arc<ZoneMap>>, Error> {
++        if !zone_map::enabled() {
++            return Ok(None);
++        }
++        let Some(component) = Component::for_index(index) else {
++            return Ok(None);
++        };
++        let map = self
++            .zone_maps
++            .get_or_build(index, attribute, self.tx_key.tx_id, || {
++                let mut prefix = vec![index];
++                crate::codec::encode_i64(attribute, &mut prefix);
++                ZoneMap::build(&prefix, self.sdb.as_ref(), &self.handle, component)
++            })?;
++        Ok(Some(map))
++    }
+ }
+ 
+ impl<D, M> Database for DB<D, M>
+diff --git a/src/indexer.rs b/src/indexer.rs
+index d137de2..cdb1429 100644
+--- a/src/indexer.rs
++++ b/src/indexer.rs
+@@ -1791,6 +1791,7 @@ mod tests {
+             tokio::runtime::Handle::current(),
+             tx1,
+             Arc::clone(&components.range_stats),
++            Arc::clone(&components.zone_maps),
+         ));
+         let rows = tokio::task::spawn_blocking(move || execute_query(&query, &[], db)).await??;
+ 
+diff --git a/src/iterator/temporal_filter_iterator.rs b/src/iterator/temporal_filter_iterator.rs
+index eaec3f3..a5660aa 100644
+--- a/src/iterator/temporal_filter_iterator.rs
++++ b/src/iterator/temporal_filter_iterator.rs
+@@ -9,6 +9,7 @@ use tokio::runtime::Handle;
+ use crate::codec;
+ use crate::slate::DEFAULT_SCAN_OPTIONS;
+ use crate::util::next_prefix;
++use crate::zone_map::ZoneMap;
+ 
+ use super::slate_iterator::{Extractor, Index};
+ 
+@@ -33,6 +34,7 @@ where
+     extractor: Extractor,
+     as_of_encoded: [u8; 8],
+     range_stats: Arc<slatedb_estimates::RangeStats<M>>,
++    zone_map: Option<Arc<ZoneMap>>,
+ }
+ 
+ /// Extract the logical key from a full key (everything except timestamp + op suffix).
+@@ -53,6 +55,22 @@ where
+         as_of: i64,
+         range_stats: Arc<slatedb_estimates::RangeStats<M>>,
+     ) -> Result<Self, Error>
++    where
++        D: DbReadOps + Send + Sync,
++    {
++        Self::new_with_zone_map(prefix, slate, handle, extractor, as_of, range_stats, None)
++    }
++
++    /// Like `new`, but consults `zone_map` to jump over runs entirely newer than `as_of`.
++    pub fn new_with_zone_map<D>(
++        prefix: &[u8],
++        slate: &D,
++        handle: Handle,
++        extractor: Extractor,
++        as_of: i64,
++        range_stats: Arc<slatedb_estimates::RangeStats<M>>,
++        zone_map: Option<Arc<ZoneMap>>,
++    ) -> Result<Self, Error>
+     where
+         D: DbReadOps + Send + Sync,
+     {
+@@ -69,6 +87,7 @@ where
+             extractor,
+             as_of_encoded,
+             range_stats,
++            zone_map,
+         };
+ 
+         // Advance to the first valid entry
+@@ -122,7 +141,21 @@ where
+                         self.current_key = Some(key);
+                         return Ok(());
+                     }
+-                    // Entry is newer than as_of — skip it, keep scanning.
++                    // Entry is newer than as_of — skip it, keep scanning. When the zone map
++                    // says the whole run is newer, jump to the next run instead.
++                    if let Some(end) = self
++                        .zone_map
++                        .as_ref()
++                        .and_then(|zm| zm.newer_run_end(&key, &self.as_of_encoded))
++                    {
++                        if end.starts_with(&self.prefix) {
++                            self.handle.block_on(self.inner.seek(end.clone()))?;
++                        } else {
++                            // The run extends past this scan's prefix: nothing visible remains.
++                            self.current_key = None;
++                            return Ok(());
++                        }
++                    }
+                 }
+             }
+         }
+diff --git a/src/lib.rs b/src/lib.rs
+index b01c640..1aaebf3 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -33,6 +33,7 @@ pub mod tx;
+ mod union_find;
+ pub mod upsert_resolution;
+ mod util;
++pub mod zone_map;
+ 
+ pub mod config;
+ pub mod node;
+diff --git a/src/node.rs b/src/node.rs
+index 1e3225c..0599876 100644
+--- a/src/node.rs
++++ b/src/node.rs
+@@ -261,6 +261,7 @@ impl<L: TxLog> Node<L> {
+             handle,
+             tx_key,
+             range_stats,
++            self.slate.zone_maps.clone(),
+         ))
+     }
+ 
+@@ -331,7 +332,14 @@ impl<L: TxLog> QueryNode for Node<L> {
+             .clone();
+         let handle = Handle::current();
+         let range_stats = self.slate.range_stats.clone();
+-        DB::from_latest_sdb(self.slate.db.clone(), ident_map, handle, range_stats).await
++        DB::from_latest_sdb(
++            self.slate.db.clone(),
++            ident_map,
++            handle,
++            range_stats,
++            self.slate.zone_maps.clone(),
++        )
++        .await
+     }
+ 
+     async fn db_as_of(&self, tx_key: TxKey) -> Result<DB, Error> {
+diff --git a/src/query/patterns/triple.rs b/src/query/patterns/triple.rs
+index fd0ac0d..663455a 100644
+--- a/src/query/patterns/triple.rs
++++ b/src/query/patterns/triple.rs
+@@ -13,7 +13,8 @@ use crate::iterator::slate_iterator::{Extractor, Index, SlateIterator};
+ use crate::iterator::temporal_filter_iterator::TemporalFilterIterator;
+ use crate::query::binding_bag::{BindingBag, BindingRow};
+ use crate::query::exec_pattern::{ExecPattern, PatternId, Proposal};
+-use crate::util::make_extractor;
++use crate::util::{make_extractor, next_prefix};
++use crate::zone_map::ValueBounds;
+ 
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ pub(crate) enum TripleTerm {
+@@ -47,6 +48,8 @@ where
+     attribute: i64,
+     value: TripleTerm,
+     db: Arc<DB<D, M>>,
++    // Comparison bounds on the value variable pushed down by the planner.
++    value_bounds: Option<ValueBounds>,
+ }
+ 
+ impl<D, M> TriplePattern<D, M>
+@@ -80,9 +83,15 @@ where
+             attribute,
+             value,
+             db,
++            value_bounds: None,
+         })
+     }
+ 
++    pub(crate) fn with_value_bounds(mut self, value_bounds: Option<ValueBounds>) -> Self {
++        self.value_bounds = value_bounds.filter(|bounds| !bounds.is_empty());
++        self
++    }
++
+     fn base_prefix(&self, index_type: IndexType) -> Result<Vec<u8>> {
+         let mut prefix = vec![codec::index_type_to_prefix(index_type)?];
+         codec::encode_i64(self.attribute, &mut prefix);
+@@ -131,13 +140,17 @@ where
+                 Arc::clone(self.db.range_stats()),
+             )?)),
+             IndexType::EAV | IndexType::AVE | IndexType::AEV | IndexType::VAE => {
+-                Ok(Box::new(TemporalFilterIterator::new(
++                let zone_map = self
++                    .db
++                    .zone_map(codec::index_type_to_prefix(index_type)?, self.attribute)?;
++                Ok(Box::new(TemporalFilterIterator::new_with_zone_map(
+                     &prefix,
+                     self.db.sdb(),
+                     self.db.handle().clone(),
+                     extractor,
+                     self.db.as_of(),
+                     Arc::clone(self.db.range_stats()),
++                    zone_map,
+                 )?))
+             }
+         }
+@@ -201,11 +214,28 @@ where
+                 }
+ 
+                 let mut iterator = self.attr_var_pair_iterator(index_type)?;
++                // With V bounds on an AEV scan, the zone map can rule out an entity's
++                // whole key range before seeking to it.
++                let zone_map = match (position, &self.value_bounds) {
++                    (TriplePosition::Value, Some(_)) => {
++                        self.db.zone_map(codec::AEV, self.attribute)?
++                    }
++                    _ => None,
++                };
++                let base_prefix = self.base_prefix(index_type)?;
+                 // A bound E or V constrains the scan, which still advances only once.
+                 for (first, row_indexes) in groups {
+                     if !iterator.has_next() {
+                         break;
+                     }
++                    if let (Some(zone_map), Some(bounds)) = (&zone_map, &self.value_bounds) {
++                        let mut lo = base_prefix.clone();
++                        lo.extend_from_slice(first);
++                        let hi = next_prefix(&lo);
++                        if !zone_map.range_may_match(&lo, hi.as_deref(), bounds) {
++                            continue;
++                        }
++                    }
+                     iterator.seek(first.clone())?;
+ 
+                     let mut group_extensions = Vec::new();
+@@ -226,8 +256,27 @@ where
+             TripleTerm::Variable(_) => {
+                 let index_type = Self::index_type(position, false);
+                 let mut iterator = self.attr_var_iterator(index_type)?;
++                let bounds = match position {
++                    TriplePosition::Value => self.value_bounds.as_ref(),
++                    TriplePosition::Entity => None,
++                };
++                // AV is sorted by value, so a lower bound is a seek and an upper bound ends the scan.
++                if let (Some(bounds), Some(first)) = (bounds, iterator.get_value()?) {
++                    if let Some(target) = bounds.seek_target(&first) {
++                        iterator.seek(target.clone())?;
++                    }
++                }
+                 let mut candidates = Vec::new();
+                 while let Some(value) = iterator.get_value()? {
++                    if let Some(bounds) = bounds {
++                        if bounds.above_upper(&value) {
++                            break;
++                        }
++                        if bounds.excludes(&value) {
++                            iterator.next()?;
++                            continue;
++                        }
++                    }
+                     candidates.push(vec![value]);
+                     iterator.next()?;
+                 }
+diff --git a/src/query/plan.rs b/src/query/plan.rs
+index 6f70e03..882a0a0 100644
+--- a/src/query/plan.rs
++++ b/src/query/plan.rs
+@@ -11,7 +11,7 @@ use slatedb::{DbMetadataOps, DbReadOps};
+ 
+ use crate::codec::Encode;
+ use crate::db_value::DB;
+-use crate::expr::{expr_variables, Expr};
++use crate::expr::{expr_variables, BinaryOp, Expr};
+ use crate::ops::{DataType, QueryArg};
+ use crate::query::{
+     convert_predicate, convert_where_fn, non_value_place_to_datatype, pattern_variables,
+@@ -27,6 +27,7 @@ use super::patterns::predicate::PredicatePattern;
+ use super::patterns::relation::RelationPattern;
+ use super::patterns::triple::{TriplePattern, TripleTerm};
+ use super::stage::Stage;
++use crate::zone_map::{self, ValueBounds};
+ 
+ //////////////////////////////////
+ // Descriptors
+@@ -287,6 +288,8 @@ pub(crate) struct LogicalDescriptor {
+     id: PatternId,
+     variables: Vec<Variable>,
+     kind: LogicalDescriptorKind,
++    // Comparison bounds pushed into a triple pattern's value scan (zone maps only).
++    value_bounds: Option<ValueBounds>,
+ }
+ 
+ #[derive(Clone, Debug, PartialEq)]
+@@ -374,13 +377,16 @@ impl LogicalDescriptor {
+             LogicalDescriptorKind::Triple(pattern) => {
+                 let attribute = resolve_attribute_from_pattern(&pattern.attribute, db.ident_map())
+                     .with_context(|| format!("Failed to resolve triple pattern {}", self.id))?;
+-                Ok(Arc::new(TriplePattern::new(
+-                    self.id,
+-                    entity_term(&pattern.entity)?,
+-                    attribute,
+-                    value_term(&pattern.value)?,
+-                    db,
+-                )?))
++                Ok(Arc::new(
++                    TriplePattern::new(
++                        self.id,
++                        entity_term(&pattern.entity)?,
++                        attribute,
++                        value_term(&pattern.value)?,
++                        db,
++                    )?
++                    .with_value_bounds(self.value_bounds.clone()),
++                ))
+             }
+             LogicalDescriptorKind::Relation { rows } => {
+                 let encoded_rows = rows
+@@ -808,10 +814,92 @@ fn plan_stages(
+     }
+ }
+ 
++// `[(op ?v literal)]` or `[(op literal ?v)]` with a comparison op on an orderable literal.
++fn comparison_bound(expression: &Expr) -> Option<(&Variable, BinaryOp, &DataType)> {
++    let Expr::BinaryExpr(binary) = expression else {
++        return None;
++    };
++    let (variable, op, literal) = match (binary.left.as_ref(), binary.right.as_ref()) {
++        (Expr::Variable(variable), Expr::Literal(literal)) => {
++            (variable, binary.op.clone(), literal)
++        }
++        (Expr::Literal(literal), Expr::Variable(variable)) => {
++            let flipped = match binary.op {
++                BinaryOp::Lt => BinaryOp::Gt,
++                BinaryOp::LtEq => BinaryOp::GtEq,
++                BinaryOp::Gt => BinaryOp::Lt,
++                BinaryOp::GtEq => BinaryOp::LtEq,
++                _ => return None,
++            };
++            (variable, flipped, literal)
++        }
++        _ => return None,
++    };
++    if !matches!(
++        op,
++        BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
++    ) {
++        return None;
++    }
++    // Only types whose key encoding preserves their comparison order.
++    if !matches!(
++        literal,
++        DataType::Long(_)
++            | DataType::BigInt(_)
++            | DataType::Double(_)
++            | DataType::Float(_)
++            | DataType::Instant(_)
++            | DataType::String(_)
++    ) {
++        return None;
++    }
++    Some((variable, op, literal))
++}
++
++// Bounds for every triple whose value variable is compared against a literal in this scope.
++fn pushdown_value_bounds(descriptors: &[Descriptor]) -> HashMap<PatternId, ValueBounds> {
++    if !zone_map::enabled() {
++        return HashMap::new();
++    }
++    let mut by_variable: HashMap<&Variable, ValueBounds> = HashMap::new();
++    for descriptor in descriptors {
++        let DescriptorKind::Predicate { expression } = &descriptor.kind else {
++            continue;
++        };
++        let Some((variable, op, literal)) = comparison_bound(expression) else {
++            continue;
++        };
++        let encoded = Bytes::from(literal.encode());
++        let bounds = by_variable.entry(variable).or_default();
++        match op {
++            BinaryOp::Gt => bounds.add_lower(encoded, false),
++            BinaryOp::GtEq => bounds.add_lower(encoded, true),
++            BinaryOp::Lt => bounds.add_upper(encoded, false),
++            BinaryOp::LtEq => bounds.add_upper(encoded, true),
++            _ => unreachable!("comparison_bound only returns comparison ops"),
++        }
++    }
++    descriptors
++        .iter()
++        .filter_map(|descriptor| {
++            let DescriptorKind::Triple(pattern) = &descriptor.kind else {
++                return None;
++            };
++            let PatternValuePlace::Variable(variable) = &pattern.value else {
++                return None;
++            };
++            by_variable
++                .get(variable)
++                .map(|bounds| (descriptor.id, bounds.clone()))
++        })
++        .collect()
++}
++
+ fn plan_descriptor(
+     descriptor: Descriptor,
+     incoming_variables: Option<Vec<Variable>>,
+     variable_order: &[Variable],
++    value_bounds: Option<ValueBounds>,
+ ) -> Result<LogicalDescriptor> {
+     let kind = match descriptor.kind {
+         DescriptorKind::Triple(pattern) => LogicalDescriptorKind::Triple(pattern),
+@@ -861,6 +949,7 @@ fn plan_descriptor(
+         id: descriptor.id,
+         variables: descriptor.variables,
+         kind,
++        value_bounds,
+     })
+ }
+ 
+@@ -882,6 +971,7 @@ fn plan_scope(
+             .collect::<Vec<_>>()
+     });
+     let stages = plan_stages(&descriptors, variable_order, incoming_variables.as_deref())?;
++    let mut value_bounds = pushdown_value_bounds(&descriptors);
+     let mut descriptor_input_layouts = HashMap::new();
+     let mut previous_target: &[Variable] = &[];
+     // TODO: This descriptor_input_layouts magic looks smelly. This should be one fold/walk over
+@@ -925,7 +1015,8 @@ fn plan_scope(
+                 }
+                 _ => None,
+             };
+-            plan_descriptor(descriptor, descriptor_input_layout, variable_order)
++            let bounds = value_bounds.remove(&descriptor.id);
++            plan_descriptor(descriptor, descriptor_input_layout, variable_order, bounds)
+         })
+         .collect::<Result<Vec<_>>>()?;
+     Ok(LogicalPlan {
+diff --git a/src/query/test_support.rs b/src/query/test_support.rs
+index e3f91d3..b36c6ef 100644
+--- a/src/query/test_support.rs
++++ b/src/query/test_support.rs
+@@ -23,5 +23,6 @@ pub(crate) fn db_at_tx_id(
+             system_time: st_from_unix_epoch(0),
+         },
+         Arc::clone(&components.range_stats),
++        Arc::clone(&components.zone_maps),
+     ))
+ }
+diff --git a/src/schema.rs b/src/schema.rs
+index ddf9703..1d03209 100644
+--- a/src/schema.rs
++++ b/src/schema.rs
+@@ -855,6 +855,7 @@ pub(crate) async fn load_schema_from_indices(slate: &crate::slate::SlateComponen
+         Handle::current(),
+         *SCHEMA_LOAD_TX_KEY,
+         Arc::clone(&slate.range_stats),
++        Arc::clone(&slate.zone_maps),
+     ));
+ 
+     let ident_query: ParsedQuery = "[:find ?e ?ident :where [?e :db/ident ?ident]]"
+diff --git a/src/slate/mod.rs b/src/slate/mod.rs
+index 624fd67..5ae7abd 100644
+--- a/src/slate/mod.rs
++++ b/src/slate/mod.rs
+@@ -16,6 +16,7 @@ use std::sync::Arc;
+ use std::time::Duration;
+ 
+ use crate::util::random_string;
++use crate::zone_map::ZoneMapCache;
+ 
+ pub const DEFAULT_BLOCK_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+ pub const DEFAULT_META_CACHE_BYTES: u64 = 512 * 1024 * 1024;
+@@ -55,6 +56,7 @@ pub struct SlateComponents {
+     pub object_path: String,
+     pub object_store: Arc<dyn ObjectStore>,
+     pub range_stats: Arc<slatedb_estimates::RangeStats>,
++    pub zone_maps: Arc<ZoneMapCache>,
+ }
+ 
+ impl std::fmt::Debug for SlateComponents {
+@@ -87,6 +89,7 @@ pub async fn in_memory_slate() -> SlateComponents {
+         object_path: path,
+         object_store,
+         range_stats,
++        zone_maps: Arc::new(ZoneMapCache::default()),
+     }
+ }
+ 
+@@ -116,6 +119,7 @@ pub async fn local_slate(root_path: &Path) -> SlateComponents {
+         object_path: slate_path,
+         object_store,
+         range_stats,
++        zone_maps: Arc::new(ZoneMapCache::default()),
+     }
+ }
+ 
+@@ -174,6 +178,7 @@ pub async fn remote_slate(
+         object_path: path,
+         object_store,
+         range_stats,
++        zone_maps: Arc::new(ZoneMapCache::default()),
+     })
+ }
+ 
+diff --git a/src/zone_map.rs b/src/zone_map.rs
+new file mode 100644
+index 0000000..c179a6a
+--- /dev/null
++++ b/src/zone_map.rs
+@@ -0,0 +1,439 @@
++//! Zone maps: per-run min/max summaries over an index prefix, used to skip
++//! seeks and runs that cannot contain matching datoms.
++//!
++//! A zone map covers one `(index, attribute)` prefix. Keys are split into runs
++//! of `RUN_SIZE` consecutive keys (in key order) and each run records the
++//! min/max of one non-key-prefix component (V for AEV, E for AVE) and the
++//! oldest/newest tx id. Maps are built in memory by scanning the prefix and are
++//! cached per basis: a map built when the basis was `S` stays sound for any
++//! query at basis `<= S` because index keys are never deleted and every later
++//! key carries a tx id `> S`.
++//!
++//! Enabled with `TRIPLOX_ZONE_MAPS=1` (or `set_enabled`).
++
++use std::collections::HashMap;
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::sync::{Arc, Mutex, OnceLock};
++use std::time::Instant;
++
++use anyhow::Error;
++use bytes::Bytes;
++use slatedb::DbReadOps;
++use tokio::runtime::Handle;
++
++use crate::codec;
++use crate::slate::DEFAULT_SCAN_OPTIONS;
++
++pub const RUN_SIZE: usize = 256;
++
++static ENABLED: OnceLock<AtomicBool> = OnceLock::new();
++
++fn enabled_flag() -> &'static AtomicBool {
++    ENABLED.get_or_init(|| {
++        let on = std::env::var("TRIPLOX_ZONE_MAPS")
++            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
++            .unwrap_or(false);
++        AtomicBool::new(on)
++    })
++}
++
++pub fn enabled() -> bool {
++    enabled_flag().load(Ordering::Relaxed)
++}
++
++pub fn set_enabled(on: bool) {
++    enabled_flag().store(on, Ordering::Relaxed);
++}
++
++// ---------------------------------------------------------------------------
++// Counters (process-wide, reset by `take_stats`)
++// ---------------------------------------------------------------------------
++
++static SEEKS_SKIPPED: AtomicU64 = AtomicU64::new(0);
++static SEEKS_CHECKED: AtomicU64 = AtomicU64::new(0);
++static RUNS_SKIPPED_T: AtomicU64 = AtomicU64::new(0);
++static BUILDS: AtomicU64 = AtomicU64::new(0);
++static BUILD_MICROS: AtomicU64 = AtomicU64::new(0);
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct ZoneMapStats {
++    /// AEV per-entity seeks skipped because no run in the entity's range can match the V bounds.
++    pub seeks_skipped: u64,
++    /// AEV per-entity seeks that consulted a zone map.
++    pub seeks_checked: u64,
++    /// Runs jumped over by the temporal filter because every key was newer than the basis.
++    pub runs_skipped_t: u64,
++    pub builds: u64,
++    pub build_micros: u64,
++}
++
++pub fn take_stats() -> ZoneMapStats {
++    ZoneMapStats {
++        seeks_skipped: SEEKS_SKIPPED.swap(0, Ordering::Relaxed),
++        seeks_checked: SEEKS_CHECKED.swap(0, Ordering::Relaxed),
++        runs_skipped_t: RUNS_SKIPPED_T.swap(0, Ordering::Relaxed),
++        builds: BUILDS.swap(0, Ordering::Relaxed),
++        build_micros: BUILD_MICROS.swap(0, Ordering::Relaxed),
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Value bounds pushed down from comparison predicates
++// ---------------------------------------------------------------------------
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) struct Bound {
++    pub value: Bytes,
++    pub inclusive: bool,
++}
++
++/// Encoded-value bounds on the V position of one triple pattern. Encodings are
++/// order preserving within a type, so comparisons only apply when the type tag
++/// (first byte) matches; otherwise the bound is ignored.
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub(crate) struct ValueBounds {
++    pub lower: Option<Bound>,
++    pub upper: Option<Bound>,
++}
++
++fn tag(encoded: &[u8]) -> Option<u8> {
++    encoded.first().copied()
++}
++
++impl ValueBounds {
++    pub(crate) fn is_empty(&self) -> bool {
++        self.lower.is_none() && self.upper.is_none()
++    }
++
++    // Keep the tighter of two bounds of the same type; otherwise keep the existing one.
++    fn tighten(existing: &mut Option<Bound>, candidate: Bound, keep_greater: bool) {
++        match existing {
++            None => *existing = Some(candidate),
++            Some(current) if tag(&current.value) == tag(&candidate.value) => {
++                let replace = match candidate.value.cmp(&current.value) {
++                    std::cmp::Ordering::Greater => keep_greater,
++                    std::cmp::Ordering::Less => !keep_greater,
++                    std::cmp::Ordering::Equal => !candidate.inclusive,
++                };
++                if replace {
++                    *current = candidate;
++                }
++            }
++            Some(_) => {}
++        }
++    }
++
++    pub(crate) fn add_lower(&mut self, value: Bytes, inclusive: bool) {
++        Self::tighten(&mut self.lower, Bound { value, inclusive }, true);
++    }
++
++    pub(crate) fn add_upper(&mut self, value: Bytes, inclusive: bool) {
++        Self::tighten(&mut self.upper, Bound { value, inclusive }, false);
++    }
++
++    /// True when the bound's type tag equals `encoded`'s, i.e. byte comparison is meaningful.
++    fn comparable(bound: &Bound, encoded: &[u8]) -> bool {
++        tag(&bound.value) == tag(encoded)
++    }
++
++    /// Whether a run whose V values span `[min_v, max_v]` may contain a matching value.
++    pub(crate) fn run_may_match(&self, min_v: &[u8], max_v: &[u8]) -> bool {
++        if let Some(lower) = &self.lower {
++            if Self::comparable(lower, max_v) {
++                match max_v.cmp(lower.value.as_ref()) {
++                    std::cmp::Ordering::Less => return false,
++                    std::cmp::Ordering::Equal if !lower.inclusive => return false,
++                    _ => {}
++                }
++            }
++        }
++        if let Some(upper) = &self.upper {
++            if Self::comparable(upper, min_v) {
++                match min_v.cmp(upper.value.as_ref()) {
++                    std::cmp::Ordering::Greater => return false,
++                    std::cmp::Ordering::Equal if !upper.inclusive => return false,
++                    _ => {}
++                }
++            }
++        }
++        true
++    }
++
++    /// Whether a single encoded value is definitely outside the bounds.
++    pub(crate) fn excludes(&self, encoded: &[u8]) -> bool {
++        !self.run_may_match(encoded, encoded)
++    }
++
++    /// Whether `encoded` lies above the upper bound (same type only).
++    pub(crate) fn above_upper(&self, encoded: &[u8]) -> bool {
++        match &self.upper {
++            Some(upper) if Self::comparable(upper, encoded) => match encoded.cmp(&upper.value) {
++                std::cmp::Ordering::Greater => true,
++                std::cmp::Ordering::Equal => !upper.inclusive,
++                std::cmp::Ordering::Less => false,
++            },
++            _ => false,
++        }
++    }
++
++    /// Seek target for a sorted scan of values with the same type tag as `first_value`.
++    pub(crate) fn seek_target(&self, first_value: &[u8]) -> Option<&Bytes> {
++        match &self.lower {
++            Some(lower) if Self::comparable(lower, first_value) => Some(&lower.value),
++            _ => None,
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Zone map
++// ---------------------------------------------------------------------------
++
++#[derive(Clone, Debug)]
++struct Run {
++    /// First key of the run; the run ends at the next run's start.
++    start: Bytes,
++    min_component: Bytes,
++    max_component: Bytes,
++    /// Largest encoded tx id in the run = oldest tx (encoding is descending).
++    oldest_ts: [u8; 8],
++}
++
++/// Which non-prefix component the run min/max summarises.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Component {
++    /// V in `[AEV][attr][E][V][T][op]`
++    AevValue,
++    /// E in `[AVE][attr][V][E][T][op]`
++    AveEntity,
++}
++
++impl Component {
++    pub(crate) fn for_index(index: u8) -> Option<Self> {
++        match index {
++            codec::AEV => Some(Self::AevValue),
++            codec::AVE => Some(Self::AveEntity),
++            _ => None,
++        }
++    }
++
++    fn extract<'a>(self, key: &'a [u8]) -> &'a [u8] {
++        let end = key.len() - codec::TX_EID_OP_SUFFIX;
++        match self {
++            Self::AevValue => {
++                &key[codec::CODEC_LENGTH + codec::ATTRIBUTE_LENGTH + codec::ENTITY_LENGTH..end]
++            }
++            Self::AveEntity => &key[end - codec::ENTITY_LENGTH..end],
++        }
++    }
++}
++
++#[derive(Debug)]
++pub(crate) struct ZoneMap {
++    runs: Vec<Run>,
++    keys: u64,
++}
++
++impl ZoneMap {
++    /// Build by scanning every key under `prefix`. Runs are `RUN_SIZE` keys in key order.
++    pub(crate) fn build<D>(
++        prefix: &[u8],
++        slate: &D,
++        handle: &Handle,
++        component: Component,
++    ) -> Result<Self, Error>
++    where
++        D: DbReadOps + Send + Sync,
++    {
++        let started = Instant::now();
++        let mut iterator =
++            handle.block_on(slate.scan_prefix_with_options(prefix, .., &DEFAULT_SCAN_OPTIONS))?;
++        let mut runs: Vec<Run> = Vec::new();
++        let mut in_run = 0usize;
++        let mut keys = 0u64;
++        while let Some(kv) = handle.block_on(iterator.next())? {
++            let key = kv.key;
++            let comp = component.extract(&key);
++            let ts: [u8; 8] = key
++                [key.len() - codec::TX_EID_OP_SUFFIX..key.len() - codec::OP_LENGTH]
++                .try_into()
++                .expect("tx id suffix");
++            keys += 1;
++            if in_run == RUN_SIZE || runs.is_empty() {
++                runs.push(Run {
++                    min_component: Bytes::copy_from_slice(comp),
++                    max_component: Bytes::copy_from_slice(comp),
++                    oldest_ts: ts,
++                    start: key.clone(),
++                });
++                in_run = 0;
++            } else {
++                let run = runs.last_mut().expect("run exists");
++                if comp < run.min_component.as_ref() {
++                    run.min_component = Bytes::copy_from_slice(comp);
++                }
++                if comp > run.max_component.as_ref() {
++                    run.max_component = Bytes::copy_from_slice(comp);
++                }
++                if ts > run.oldest_ts {
++                    run.oldest_ts = ts;
++                }
++            }
++            in_run += 1;
++        }
++        BUILDS.fetch_add(1, Ordering::Relaxed);
++        BUILD_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
++        Ok(Self { runs, keys })
++    }
++
++    pub(crate) fn runs(&self) -> usize {
++        self.runs.len()
++    }
++
++    pub(crate) fn keys(&self) -> u64 {
++        self.keys
++    }
++
++    /// Index of the run whose start is `<= key`, if any.
++    fn run_index(&self, key: &[u8]) -> Option<usize> {
++        self.runs
++            .partition_point(|run| run.start.as_ref() <= key)
++            .checked_sub(1)
++    }
++
++    /// Whether some key in `[lo, hi)` (hi = None means unbounded) may match `bounds`.
++    /// Keys before the first run cannot exist at any basis the map is valid for.
++    pub(crate) fn range_may_match(
++        &self,
++        lo: &[u8],
++        hi: Option<&[u8]>,
++        bounds: &ValueBounds,
++    ) -> bool {
++        SEEKS_CHECKED.fetch_add(1, Ordering::Relaxed);
++        let first = self.run_index(lo).unwrap_or(0);
++        let end = match hi {
++            Some(hi) => self.runs.partition_point(|run| run.start.as_ref() < hi),
++            None => self.runs.len(),
++        };
++        let may = self.runs[first..end.max(first)]
++            .iter()
++            .any(|run| bounds.run_may_match(&run.min_component, &run.max_component));
++        if !may {
++            SEEKS_SKIPPED.fetch_add(1, Ordering::Relaxed);
++        }
++        may
++    }
++
++    /// If every key in `key`'s run is newer than the basis (`as_of_encoded` is the
++    /// descending-encoded basis tx), return the start of the next run to seek to.
++    /// Returns `Err(())`-like `None` for the last run, which has no successor to jump to.
++    pub(crate) fn newer_run_end(&self, key: &[u8], as_of_encoded: &[u8; 8]) -> Option<&Bytes> {
++        let index = self.run_index(key)?;
++        let run = &self.runs[index];
++        if run.oldest_ts < *as_of_encoded {
++            let next = self.runs.get(index + 1)?;
++            RUNS_SKIPPED_T.fetch_add(1, Ordering::Relaxed);
++            Some(&next.start)
++        } else {
++            None
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Cache: one map per (index, attribute), tagged with the basis it was built at
++// ---------------------------------------------------------------------------
++
++#[derive(Default)]
++pub struct ZoneMapCache {
++    maps: Mutex<HashMap<(u8, i64), (i64, Arc<ZoneMap>)>>,
++}
++
++impl std::fmt::Debug for ZoneMapCache {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("ZoneMapCache").finish_non_exhaustive()
++    }
++}
++
++impl ZoneMapCache {
++    /// Return the cached map for `(index, attribute)` if it was built at a basis `>= basis`,
++    /// otherwise build one via `build` and cache it under `basis`.
++    pub(crate) fn get_or_build(
++        &self,
++        index: u8,
++        attribute: i64,
++        basis: i64,
++        build: impl FnOnce() -> Result<ZoneMap, Error>,
++    ) -> Result<Arc<ZoneMap>, Error> {
++        if let Some((built_at, map)) = self.maps.lock().unwrap().get(&(index, attribute)) {
++            if *built_at >= basis {
++                return Ok(Arc::clone(map));
++            }
++        }
++        let map = Arc::new(build()?);
++        self.maps
++            .lock()
++            .unwrap()
++            .insert((index, attribute), (basis, Arc::clone(&map)));
++        Ok(map)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::codec::Encode;
++    use crate::ops::DataType;
++
++    fn enc(value: i64) -> Bytes {
++        Bytes::from(DataType::Long(value).encode())
++    }
++
++    #[test]
++    fn bounds_prune_runs_at_boundaries() {
++        let mut gt = ValueBounds::default();
++        gt.add_lower(enc(900), false);
++        assert!(!gt.run_may_match(&enc(0), &enc(900)));
++        assert!(gt.run_may_match(&enc(0), &enc(901)));
++
++        let mut ge = ValueBounds::default();
++        ge.add_lower(enc(900), true);
++        assert!(ge.run_may_match(&enc(0), &enc(900)));
++        assert!(!ge.run_may_match(&enc(0), &enc(899)));
++
++        let mut lt = ValueBounds::default();
++        lt.add_upper(enc(10), false);
++        assert!(!lt.run_may_match(&enc(10), &enc(20)));
++        assert!(lt.run_may_match(&enc(9), &enc(20)));
++
++        let mut le = ValueBounds::default();
++        le.add_upper(enc(10), true);
++        assert!(le.run_may_match(&enc(10), &enc(20)));
++        assert!(!le.run_may_match(&enc(11), &enc(20)));
++    }
++
++    #[test]
++    fn bounds_ignore_mismatched_types() {
++        let mut gt = ValueBounds::default();
++        gt.add_lower(enc(900), false);
++        let s = Bytes::from(DataType::String("a".into()).encode());
++        assert!(gt.run_may_match(&s, &s));
++        assert!(!gt.excludes(&s));
++        assert!(gt.excludes(&enc(900)));
++        assert!(!gt.excludes(&enc(901)));
++    }
++
++    #[test]
++    fn tighten_keeps_tighter_bound() {
++        let mut b = ValueBounds::default();
++        b.add_lower(enc(5), true);
++        b.add_lower(enc(7), false);
++        b.add_lower(enc(6), true);
++        assert_eq!(b.lower.as_ref().unwrap().value, enc(7));
++        b.add_upper(enc(20), true);
++        b.add_upper(enc(20), false);
++        assert!(!b.upper.as_ref().unwrap().inclusive);
++        b.add_upper(enc(30), false);
++        assert_eq!(b.upper.as_ref().unwrap().value, enc(20));
++    }
++}
+-- 
+2.51.2
+

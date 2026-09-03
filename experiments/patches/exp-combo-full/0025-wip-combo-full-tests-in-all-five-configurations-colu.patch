@@ -1,0 +1,68 @@
+From 53b1773d222532a0eae32d0a183c1d8931e2a2a6 Mon Sep 17 00:00:00 2001
+From: Ben Lovell <ben.j.lovell@gmail.com>
+Date: Thu, 3 Sep 2026 20:57:16 +0200
+Subject: [PATCH 25/36] wip(combo-full): tests in all five configurations;
+ columnar forces 11 failures (10 known + the vectorized equivalence test, same
+ harness artifact)
+
+---
+ PROGRESS.md              | 27 ++++++++++++++-------------
+ benches/datalog_bench.rs |  2 ++
+ 2 files changed, 16 insertions(+), 13 deletions(-)
+
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 08805c4..d819e67 100644
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -7,21 +7,22 @@ Resolve conflicts so that BOTH features work and both toggles remain independent
+ Each source branch has an EXPERIMENT.md (design, toggle env var names, hook points, known regressions) and an equivalence test. Read them before merging. Keep their EXPERIMENT.md/PROGRESS.md content by moving each to docs/<branch>-EXPERIMENT.md so the merge conflict on those two files is trivial; this worktree's own PROGRESS.md (this file) and COMBINED.md are the live documents.
+ 
+ ## Status
+-- All three branches merged; `cargo check --all-targets` clean.
+-  - `exp/vectorized-join`: conflict PROGRESS.md only.
+-  - `exp/columnar-storage`: conflicts PROGRESS.md + src/query/patterns/triple.rs (import block only; took both).
+-  - `exp/sparse-matrix`: conflicts PROGRESS.md, src/db_value.rs (DB gains both `layout` and `adjacency` fields), src/node.rs (Node gains both `layout` and `adjacency_cache`; `db_as_of`/`db_with_adjacency` now apply `.with_layout` then `attach_adjacency`).
+-  - Each source EXPERIMENT.md/PROGRESS.md moved to docs/<branch>-*.
+-- Known interactions identified by reading, still to be confirmed by running:
+-  1. `AdjacencyPattern` has no `BatchPattern`, so `BatchedJoinEngine::supports` rejects any query with a ref triple pattern -> silent fallback to the row engine when ADJ+BATCHED are both on.
+-  2. `AdjMatrix::build` builds a raw `TemporalFilterIterator` over AEV row keys, bypassing `SegmentIterator`. Under `TRIPLOX_SEGMENT_LAYOUT=columnar` there are no AEV row keys, so the matrix would be built from segment headers. Must be fixed.
+-  3. Columnar composes with the batched join for free: `TriplePattern::as_batch` reaches storage through the same `create_iterator`/`estimate_count` helpers columnar patches.
++- All three merged, `cargo check --all-targets` clean. Conflicts: PROGRESS.md (all three), src/query/patterns/triple.rs (import block, columnar), src/db_value.rs + src/node.rs (DB/Node gain both `layout` and `adjacency*` fields).
++- Fixed a real cross-experiment bug: `AdjMatrix::build` scanned AEV with a raw `TemporalFilterIterator`, which under columnar reads segment headers instead of datoms. It now picks `SegmentIterator` when the layout is columnar. Proven: reverting the fix makes `adjacency_path_matches_iterator_path` fail with wrong (not erroring) results under columnar+adj.
++- Added `TRIPLOX_ENGINE_LOG=1` at the `execute_query` fork and a `--query <name>` stderr marker in the bench, so the engine actually chosen is observable per query.
++- Test status (`cargo test -p triplox`):
++  - off: 619 lib + 23 + 3 + 6, all green.
++  - TRIPLOX_BATCHED_JOIN=1 alone: all green.
++  - TRIPLOX_ADJ_MATRIX=1 alone: all green.
++  - TRIPLOX_SEGMENT_LAYOUT=columnar alone: 608 passed / 11 failed.
++  - all three on: same 608 / 11, no extra failures from combining.
++  - The 11 are columnar's documented 10 plus `query::vectorized::tests::batched_engine_matches_the_row_engine`, which is the same harness artifact: the test writes raw AEV/AVE/AE/AV row keys with `slate.put` and then reads through the query engine, which in columnar mode reports "bad segment header". So the batched-vs-row equivalence test cannot run under the columnar layout; bench row counts are the substitute check there.
+ 
+ ## Next
+-1. Fix (2): route `AdjMatrix::build` through the columnar segment iterator.
+-2. Add a `TRIPLOX_ENGINE_LOG` trace at the `execute_query` fork so the bench reports which engine ran per query.
+-3. Run source equivalence tests + full suite in each configuration.
+-4. Interleaved bench, then COMBINED.md.
++1. clippy in every configuration.
++2. `TRIPLOX_ENGINE_LOG` probe run: which engine ran per query, per configuration.
++3. Interleaved bench (off / batched / columnar / adj / all, 3 passes) via scratchpad/bench.sh.
++4. COMBINED.md.
+ 
+ ## Shared context
+ 
+diff --git a/benches/datalog_bench.rs b/benches/datalog_bench.rs
+index ff60c22..143b0ca 100644
+--- a/benches/datalog_bench.rs
++++ b/benches/datalog_bench.rs
+@@ -193,6 +193,8 @@ async fn main() {
+         {
+             continue;
+         }
++        // Marks the stderr stream so a TRIPLOX_ENGINE_LOG run can be read per query.
++        eprintln!("--query {name}");
+         let mut times = Vec::with_capacity(runs);
+         let mut rows = 0;
+         for _ in 0..runs {
+-- 
+2.51.2
+

@@ -1,0 +1,205 @@
+From 2fef3827ce9de7ec0c2bd07a07736c2041d4428b Mon Sep 17 00:00:00 2001
+From: Ben Lovell <ben.j.lovell@gmail.com>
+Date: Thu, 3 Sep 2026 19:51:45 +0200
+Subject: [PATCH 2/7] wip(zone-maps): add on/off equivalence and skip-count
+ tests; note disk exhaustion
+
+---
+ PROGRESS.md     |  18 ++++--
+ src/zone_map.rs | 146 +++++++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 159 insertions(+), 5 deletions(-)
+
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 07e2b71..e14760d 100644
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -4,10 +4,20 @@
+ Per-run (RUN_SIZE keys in key order) min/max of the non-prefix component (V for AEV, E for AVE) plus oldest/newest tx id, per (index, attribute), built in memory by scanning the prefix and cached per basis (sound for any basis <= build basis, see module doc). Planner pushes comparison predicates on a single-pattern variable into the scan as V bounds; iterators skip runs. Toggle: TRIPLOX_ZONE_MAPS=1. Also measure an as-of query at an early basis.
+ 
+ ## Status (as of hand-off)
+-- Compiles (cargo check --all-targets clean).
+-- New: src/zone_map.rs (ZoneMap build/cache, set_enabled, skip counters).
+-- Modified: benches/datalog_bench.rs, db_value.rs, indexer.rs, iterator/temporal_filter_iterator.rs, lib.rs, node.rs, query/plan.rs, query/patterns/triple.rs, query/test_support.rs, schema.rs, slate/mod.rs (SlateComponents carries the maps).
+-- Previous agent had just finished the plumbing edits (lib.rs, SlateComponents, DB, four call sites). Unknown whether predicate pushdown in plan.rs is complete or whether the iterator actually consults the map yet. Check by running weight_filter with the toggle on and reading the skip counters.
++- Compiles clean (`cargo check -p triplox --lib --tests`, `cargo check --all-targets`).
++- Plumbing is complete: planner pushdown (src/query/plan.rs), AEV per-entity seek pruning and
++  AV sorted-scan seek/early-exit (src/query/patterns/triple.rs), temporal run skipping
++  (src/iterator/temporal_filter_iterator.rs), cache on SlateComponents (src/slate/mod.rs).
++- New tests in src/zone_map.rs: `results_match_with_zone_maps_on_and_off` (10 queries x
++  {latest, as-of} x {cold cache, warm cache}) and `zone_map_prunes_and_counts_skips`
++  (asserts seeks_checked > 0 and seeks_skipped > 0). NOT YET RUN - see disk note.
++
++### MACHINE DISK IS FULL (blocking)
++`/` fluctuates between ~145Mi and ~4Gi free; five agents share it. `cargo test` and
++`cargo bench` builds fail with ENOSPC mid-link. I deleted only this worktree's
++`target/release` (never `cargo clean`). Do not touch other worktrees' targets.
++Strategy: wait for free space with a background monitor, then build in this order -
++(1) `cargo test -p triplox --lib`, (2) `cargo clippy`, (3) `cargo bench` (release, biggest).
+ 
+ ## Next
+ 1. Verify pushdown and run-skipping work end to end (skip counters > 0 on weight_filter, rows still 198).
+diff --git a/src/zone_map.rs b/src/zone_map.rs
+index c179a6a..fba02ec 100644
+--- a/src/zone_map.rs
++++ b/src/zone_map.rs
+@@ -383,7 +383,13 @@ impl ZoneMapCache {
+ mod tests {
+     use super::*;
+     use crate::codec::Encode;
+-    use crate::ops::DataType;
++    use crate::node::{Node, QueryNode, SubmitNode};
++    use crate::ops::{DataType, TxOp};
++    use crate::memory_log::MemoryLog;
++    use crate::schema::test_schema_tx;
++    use edn::kw;
++    use triplox_client::node::Database;
++    use triplox_client::transaction::{TransactionResult, TxKey};
+ 
+     fn enc(value: i64) -> Bytes {
+         Bytes::from(DataType::Long(value).encode())
+@@ -436,4 +442,142 @@ mod tests {
+         b.add_upper(enc(30), false);
+         assert_eq!(b.upper.as_ref().unwrap().value, enc(20));
+     }
++
++    // The toggle is process-wide, so the on/off tests take turns.
++    static TOGGLE: Mutex<()> = Mutex::new(());
++
++    const EQUIVALENCE_QUERIES: &[&str] = &[
++        "[:find ?e :where [?e :age ?a] [(> ?a 200)]]",
++        "[:find ?e :where [?e :age ?a] [(>= ?a 200)]]",
++        "[:find ?e :where [?e :age ?a] [(< ?a 20)]]",
++        "[:find ?e :where [?e :age ?a] [(<= ?a 20)]]",
++        "[:find ?e ?a :where [?e :age ?a] [(>= ?a 150)] [(< ?a 160)]]",
++        "[:find ?e :where [?e :age ?a] [(> ?a 100000)]]",
++        "[:find ?e :where [?e :age ?a] [(>= ?a -5)]]",
++        // Bound entity from the first pattern, so the AEV scan seeks per entity.
++        "[:find ?e ?n :where [?e :name ?n] [?e :age ?a] [(> ?a 290)]]",
++        // String bounds exercise the type-tag check.
++        "[:find ?e :where [?e :name ?n] [(> ?n \"name-0500\")]]",
++        "[:find (count ?e) :where [?e :age ?a]]",
++    ];
++
++    async fn commit(node: &Node<MemoryLog>, ops: Vec<TxOp>) -> TxKey {
++        match node.execute_tx(ops).await.expect("tx executes") {
++            TransactionResult::TxCommitted(key) => key,
++            TransactionResult::TxAborted(_, error) => panic!("tx aborted: {error}"),
++        }
++    }
++
++    /// 600 entities with `:age` cycling through 0..300 so an AEV run boundary
++    /// (RUN_SIZE = 256) falls inside the attribute and runs overlap in value.
++    async fn seeded_node() -> (Node<MemoryLog>, TxKey) {
++        let node = Node::memory_node().await;
++        commit(&node, test_schema_tx()).await;
++        let mut early = None;
++        for chunk in 0..4 {
++            let ops = (0..150)
++                .map(|offset| {
++                    let index = chunk * 150 + offset;
++                    vec![
++                        TxOp::Add {
++                            entity: format!("e{index}").into(),
++                            attribute: kw!(:age),
++                            value: DataType::Long((index * 7) % 300),
++                        },
++                        TxOp::Add {
++                            entity: format!("e{index}").into(),
++                            attribute: kw!(:name),
++                            value: DataType::String(format!("name-{index:04}")),
++                        },
++                    ]
++                })
++                .flatten()
++                .collect::<Vec<_>>();
++            let key = commit(&node, ops).await;
++            if chunk == 1 {
++                early = Some(key);
++            }
++        }
++        (node, early.expect("early basis"))
++    }
++
++    async fn run_all(node: &Node<MemoryLog>, early: TxKey) -> Vec<Vec<Vec<DataType>>> {
++        let latest = node.db().await.expect("db");
++        let as_of = node.db_as_of(early).await.expect("db as of");
++        let mut out = Vec::new();
++        for query in EQUIVALENCE_QUERIES {
++            for db in [&latest, &as_of] {
++                let mut rows = db.query(*query).await.expect("query runs");
++                rows.sort_by_key(|row| format!("{row:?}"));
++                out.push(rows);
++            }
++        }
++        out
++    }
++
++    #[tokio::test(flavor = "multi_thread")]
++    async fn results_match_with_zone_maps_on_and_off() {
++        let _guard = TOGGLE.lock().unwrap();
++        let previous = enabled();
++
++        set_enabled(false);
++        let (node, early) = seeded_node().await;
++        let off = run_all(&node, early).await;
++
++        set_enabled(true);
++        // A fresh node so the cache is built from scratch under the toggle.
++        let (node_on, early_on) = seeded_node().await;
++        let on = run_all(&node_on, early_on).await;
++        // Same node, warm cache built at the latest basis, queried again including as-of.
++        let on_same_node = run_all(&node, early).await;
++        set_enabled(previous);
++
++        for (index, query) in EQUIVALENCE_QUERIES.iter().enumerate() {
++            for (offset, label) in [(0, "latest"), (1, "as-of")] {
++                let slot = index * 2 + offset;
++                assert_eq!(
++                    off[slot], on[slot],
++                    "{label} rows differ for {query} (cold cache)"
++                );
++                assert_eq!(
++                    off[slot], on_same_node[slot],
++                    "{label} rows differ for {query} (warm cache)"
++                );
++            }
++        }
++        assert!(
++            off.iter().any(|rows| !rows.is_empty()),
++            "queries produced no rows at all"
++        );
++    }
++
++    #[tokio::test(flavor = "multi_thread")]
++    async fn zone_map_prunes_and_counts_skips() {
++        let _guard = TOGGLE.lock().unwrap();
++        let previous = enabled();
++        set_enabled(true);
++        let (node, _) = seeded_node().await;
++        let db = node.db().await.expect("db");
++        // Warm the cache, then measure one execution.
++        let _ = db
++            .query("[:find ?e ?n :where [?e :name ?n] [?e :age ?a] [(> ?a 290)]]")
++            .await
++            .expect("query runs");
++        take_stats();
++        let rows = db
++            .query("[:find ?e ?n :where [?e :name ?n] [?e :age ?a] [(> ?a 290)]]")
++            .await
++            .expect("query runs");
++        let stats = take_stats();
++        set_enabled(previous);
++        assert_eq!(rows.len(), 18, "ages 291..299 hit twice over 600 entities");
++        assert!(
++            stats.seeks_checked > 0,
++            "zone map was never consulted: {stats:?}"
++        );
++        assert!(
++            stats.seeks_skipped > 0,
++            "no per-entity seeks were pruned: {stats:?}"
++        );
++    }
+ }
+-- 
+2.51.2
+

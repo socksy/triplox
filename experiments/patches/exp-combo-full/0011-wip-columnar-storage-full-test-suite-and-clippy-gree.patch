@@ -1,0 +1,39 @@
+From bd0a09d73e6beefdc7314eb36dc69f9002738abb Mon Sep 17 00:00:00 2001
+From: Ben Lovell <ben.j.lovell@gmail.com>
+Date: Thu, 3 Sep 2026 19:58:24 +0200
+Subject: [PATCH 11/36] wip(columnar-storage): full test suite and clippy green
+ in row layout
+
+---
+ PROGRESS.md | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 009f053..0eb9f9b 100644
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -18,10 +18,18 @@ The machine disk hit 100% repeatedly; five agents build concurrently. Two things
+ - When bash tool calls fail with ENOSPC the command does not run at all. Check `df -h /System/Volumes/Data` first.
+ `target/debug` and `target/release` were deleted once each to make room (no `cargo clean`).
+ 
++### Test / clippy status
++- `cargo test -p triplox` (default = row layout): **all green** — 613 lib + 23 client_server + 3 fixture_compat + 6 subscription.
++- `cargo clippy -p triplox --all-targets`: **clean, no warnings.**
++- `TRIPLOX_SEGMENT_LAYOUT=columnar cargo test -p triplox --lib`: 603 pass, 10 fail. All 10 are test-harness artifacts, not query-result bugs:
++  - 6 `query::patterns::triple::tests::*` write raw row keys straight into SlateDB and then read through the query engine; in columnar mode the reader finds a row key where a segment should be ("bad segment header").
++  - `count_applies_bound_term_estimate_to_each_duplicate_row` asserts an exact key-count estimate; columnar deliberately scales the estimate by segment_size (6144 vs 6).
++  - `indexer::tests::test_retract_on_overwrite` asserts a raw AE key exists; columnar intentionally does not write AE/AV (they are served from AEV/AVE first columns).
++  - 2 `indexer::tests::test_lookup_tx_completion_*` pass `SegmentLayout::Row` explicitly while the indexer under test picks the layout from the env.
++
+ ## Next
+-1. Full `cargo test -p triplox` + `cargo clippy -p triplox --all-targets`.
+-2. Interleaved A/B bench, 3 runs each, JSON to results/columnar-storage-{off,on}.json.
+-3. EXPERIMENT.md, fmt, commit.
++1. Interleaved A/B bench, 3 runs each, JSON to results/columnar-storage-{off,on}.json.
++2. EXPERIMENT.md, fmt, commit.
+ 
+ ## Shared context
+ 
+-- 
+2.51.2
+

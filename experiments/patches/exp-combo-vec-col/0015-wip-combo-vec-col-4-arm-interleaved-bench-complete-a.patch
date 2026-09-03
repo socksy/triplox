@@ -1,0 +1,27 @@
+From 0063ec67e9a756677d2dc23b349c6b6f65b1238d Mon Sep 17 00:00:00 2001
+From: Ben Lovell <ben.j.lovell@gmail.com>
+Date: Thu, 3 Sep 2026 21:13:31 +0200
+Subject: [PATCH 15/19] wip(combo-vec-col): 4-arm interleaved bench complete,
+ attribution JSON written
+
+---
+ PROGRESS.md | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 87445df..cfe2ad1 100644
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -12,7 +12,8 @@ Each source branch has an EXPERIMENT.md (design, toggle env var names, hook poin
+ 
+ ## Next
+ 1. DONE: merges + cargo check.
+-2. Bench running (4 arms x 3 passes, results in scratchpad/combo/<arm>-p<n>.json, aggregate with scratchpad/combo/agg.py). Pass-1 off arm row counts match baseline exactly.
++2. DONE: bench, 4 arms x 3 passes, interleaved. results/combo-vec-col-{off,batched,columnar,all}.json written. Row counts identical in all four arms and match baseline. Headline (median of 3 pass-medians, ms): triangles 548/321/408/191, three_hop 10597/3805/11371/2659, out_degree 48/41/13.5/8.9. all/off ranges 0.06-0.40 on everything except label_lookup (20us, noise).
++   three_hop: columnar alone regresses (1.07x median, 1.27x min); with batching on, adding columnar is neutral-to-better (all/batched 0.70 median, 0.93 min). The regression is gone under batching.
+ 3. Equivalence tests from both branches; full suite off / all-on; clippy.
+ 4. COMBINED.md.
+ 
+-- 
+2.51.2
+

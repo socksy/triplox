@@ -1,0 +1,35 @@
+From 1f9fc423032d22d67bebf050cb984f5715f12422 Mon Sep 17 00:00:00 2001
+From: Ben Lovell <ben.j.lovell@gmail.com>
+Date: Thu, 3 Sep 2026 19:59:40 +0200
+Subject: [PATCH 4/6] wip(vectorized-join): tests and clippy clean on and off
+
+---
+ src/query/patterns/triple.rs | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/query/patterns/triple.rs b/src/query/patterns/triple.rs
+index 5886435..ea1778d 100644
+--- a/src/query/patterns/triple.rs
++++ b/src/query/patterns/triple.rs
+@@ -627,6 +627,9 @@ fn for_each_group(
+     Ok(())
+ }
+ 
++// Value pool plus one `[start, end)` slice of it per input row.
++type GroupedExtensions = (Vec<Bytes>, Vec<(u32, u32)>);
++
+ fn ascending_rows(matches: &[bool]) -> Vec<u32> {
+     matches
+         .iter()
+@@ -647,7 +650,7 @@ where
+         &self,
+         view: &ColumnView,
+         index_type: IndexType,
+-    ) -> Result<(Vec<Bytes>, Vec<(u32, u32)>)> {
++    ) -> Result<GroupedExtensions> {
+         let order = sorted_rows(view.len(), |left, right| {
+             view.get(left as usize).cmp(view.get(right as usize))
+         });
+-- 
+2.51.2
+

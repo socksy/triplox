@@ -1,0 +1,32 @@
+From 7b3773addb66a69785ec65c94bcfec391cd7b05f Mon Sep 17 00:00:00 2001
+From: Ben Lovell <ben.j.lovell@gmail.com>
+Date: Thu, 3 Sep 2026 21:17:10 +0200
+Subject: [PATCH 2/2] chore(bench): record per-iteration samples in JSON output
+
+---
+ benches/datalog_bench.rs | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/benches/datalog_bench.rs b/benches/datalog_bench.rs
+index 98a2ef0..894a4a5 100644
+--- a/benches/datalog_bench.rs
++++ b/benches/datalog_bench.rs
+@@ -191,12 +191,14 @@ async fn main() {
+             times.push(start.elapsed().as_secs_f64() * 1000.0);
+             rows = result.len();
+         }
++        let samples: Vec<String> = times.iter().map(|t| format!("{t:.3}")).collect();
+         times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+         let min = times[0];
+         let median = times[times.len() / 2];
+         println!("{name:<18} {rows:>10} {min:>12.2} {median:>12.2}");
+         json.push(format!(
+-            "{{\"query\":\"{name}\",\"rows\":{rows},\"min_ms\":{min:.3},\"median_ms\":{median:.3}}}"
++            "{{\"query\":\"{name}\",\"rows\":{rows},\"min_ms\":{min:.3},\"median_ms\":{median:.3},\"samples_ms\":[{}]}}",
++            samples.join(",")
+         ));
+     }
+ 
+-- 
+2.51.2
+

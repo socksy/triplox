@@ -1,0 +1,133 @@
+From a14540cf5942a459ac6af182ef16e481ebedeb4e Mon Sep 17 00:00:00 2001
+From: Ben Lovell <ben.j.lovell@gmail.com>
+Date: Thu, 3 Sep 2026 21:26:07 +0200
+Subject: [PATCH 31/36] wip(combo-full): port the intersecting stage to the
+ batched engine so candidate sets survive batching
+
+---
+ src/query/patterns/adjacency.rs | 26 +++++++++++++++++++++
+ src/query/vectorized/engine.rs  | 41 +++++++++++++++++++++++++++++++++
+ src/query/vectorized/mod.rs     | 10 ++++++++
+ 3 files changed, 77 insertions(+)
+
+diff --git a/src/query/patterns/adjacency.rs b/src/query/patterns/adjacency.rs
+index 6a0c8f8..3eb8672 100644
+--- a/src/query/patterns/adjacency.rs
++++ b/src/query/patterns/adjacency.rs
+@@ -395,6 +395,32 @@ impl BatchPattern for AdjacencyPattern {
+         Ok((parent_rows, values))
+     }
+ 
++    fn candidate_sets_batch<'a>(
++        &'a self,
++        batch: &Batch,
++        added: &[Variable],
++    ) -> Result<Option<Vec<&'a [i64]>>> {
++        let position = self.batch_proposed_position(batch, added)?;
++        // With the other side unbound every row's candidate set is the whole key list, which is
++        // no more selective than what another proposer offers, so let the engine choose instead.
++        if let TripleTerm::Variable(other) = self.other_term(position) {
++            if !batch.contains(other) {
++                return Ok(None);
++            }
++        }
++        let csr = self.csr_for(position);
++        let sets = self
++            .batch_row_keys(batch, position)?
++            .into_iter()
++            .map(|key| match key {
++                RowKey::Key(key) => csr.row(key),
++                RowKey::All => self.keys_for(position).keys(),
++                RowKey::Missing => &[][..],
++            })
++            .collect();
++        Ok(Some(sets))
++    }
++
+     fn validate_batch(&self, batch: &Batch) -> Result<Vec<u32>> {
+         let bound = |term: &TripleTerm| match term {
+             TripleTerm::Variable(variable) => batch
+diff --git a/src/query/vectorized/engine.rs b/src/query/vectorized/engine.rs
+index 4a3be48..cc5a6a7 100644
+--- a/src/query/vectorized/engine.rs
++++ b/src/query/vectorized/engine.rs
+@@ -5,6 +5,7 @@ use anyhow::{ensure, Context, Result};
+ 
+ use super::batch::Batch;
+ use super::BatchPattern;
++use crate::query::adjacency::{encode_entity, intersect_sorted};
+ use crate::query::binding_bag::BindingBag;
+ use crate::query::exec_pattern::{PatternId, Proposal};
+ use crate::query::stage::Stage;
+@@ -68,7 +69,47 @@ impl BatchedJoinEngine {
+         Self::validate_all(Arc::new(reordered), validators)
+     }
+ 
++    // Columnar counterpart of `GenericJoinEngine::execute_intersecting_stage`: intersects the
++    // candidate sets of the proposers that can supply one and demotes the rest to validators.
++    fn execute_intersecting_stage(stage: &Stage, input: &Arc<Batch>) -> Result<Option<Arc<Batch>>> {
++        let mut per_proposer = Vec::with_capacity(stage.proposers().len());
++        let mut suppliers = Vec::new();
++        for proposer in stage.proposers() {
++            if let Some(sets) =
++                Self::batch_pattern(proposer.as_ref()).candidate_sets_batch(input, stage.added())?
++            {
++                per_proposer.push(sets);
++                suppliers.push(proposer.id());
++            }
++        }
++        if per_proposer.is_empty() {
++            return Ok(None);
++        }
++        let mut parent_rows = Vec::new();
++        let mut values = Vec::new();
++        for row in 0..input.len() {
++            let sets: Vec<&[i64]> = per_proposer.iter().map(|sets| sets[row]).collect();
++            for id in intersect_sorted(&sets) {
++                parent_rows.push(row as u32);
++                values.push(encode_entity(id));
++            }
++        }
++        let extended = input.extend(parent_rows, stage.added()[0].clone(), values)?;
++        let reordered = Arc::new(extended.reorder(stage.target_variables())?);
++        let validators = stage
++            .participants()
++            .iter()
++            .filter(|participant| !suppliers.contains(&participant.id()))
++            .map(|participant| participant.as_ref());
++        Self::validate_all(reordered, validators).map(Some)
++    }
++
+     fn execute_proposing_stage(stage: &Stage, input: &Arc<Batch>) -> Result<Arc<Batch>> {
++        if stage.proposers().len() > 1 && stage.added().len() == 1 {
++            if let Some(result) = Self::execute_intersecting_stage(stage, input)? {
++                return Ok(result);
++            }
++        }
+         if stage.proposers().len() == 1 {
+             let proposer = stage
+                 .proposers()
+diff --git a/src/query/vectorized/mod.rs b/src/query/vectorized/mod.rs
+index dac9feb..b6e4ba9 100644
+--- a/src/query/vectorized/mod.rs
++++ b/src/query/vectorized/mod.rs
+@@ -29,6 +29,16 @@ pub(crate) trait BatchPattern: Send + Sync {
+ 
+     // Row indices of `batch` that satisfy this pattern, ascending.
+     fn validate_batch(&self, batch: &Batch) -> Result<Vec<u32>>;
++
++    // Columnar counterpart of `ExecPattern::candidate_sets`: sorted entity-id candidates per row
++    // of `batch`, when they are available without IO.
++    fn candidate_sets_batch<'a>(
++        &'a self,
++        _batch: &Batch,
++        _added: &[Variable],
++    ) -> Result<Option<Vec<&'a [i64]>>> {
++        Ok(None)
++    }
+ }
+ 
+ // Row indices of `len` rows ordered by `compare`, which is a total order over row indices.
+-- 
+2.51.2
+

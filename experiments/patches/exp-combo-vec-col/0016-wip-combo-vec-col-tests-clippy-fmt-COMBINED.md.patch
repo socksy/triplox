@@ -1,0 +1,232 @@
+From abb6c363d46d487b112f897be7b88e7b0f506ad9 Mon Sep 17 00:00:00 2001
+From: Ben Lovell <ben.j.lovell@gmail.com>
+Date: Thu, 3 Sep 2026 21:16:27 +0200
+Subject: [PATCH 16/19] wip(combo-vec-col): tests, clippy, fmt, COMBINED.md
+
+---
+ COMBINED.md | 197 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ PROGRESS.md |   4 +-
+ 2 files changed, 199 insertions(+), 2 deletions(-)
+ create mode 100644 COMBINED.md
+
+diff --git a/COMBINED.md b/COMBINED.md
+new file mode 100644
+index 0000000..22c2c6a
+--- /dev/null
++++ b/COMBINED.md
+@@ -0,0 +1,197 @@
++# Combination: batched join + columnar segments
++
++Branch `exp/combo-vec-col`. Merges `exp/vectorized-join` and `exp/columnar-storage` into one
++worktree so both toggles work independently and together.
++
++- `TRIPLOX_BATCHED_JOIN=1` — columnar bindings between join levels (the batched generic join).
++- `TRIPLOX_SEGMENT_LAYOUT=columnar` — AEV/AVE stored as SoA segments; AE/AV disappear.
++
++Design, hook points and per-feature A/B results for each half are kept verbatim in
++`docs/vectorized-join-EXPERIMENT.md` and `docs/columnar-storage-EXPERIMENT.md` (plus each
++branch's PROGRESS.md alongside them).
++
++## What was merged, and what conflicted
++
++`exp/vectorized-join` merged with one conflict, in `PROGRESS.md`. Nothing in `src/` collided.
++
++`exp/columnar-storage` merged with two: `PROGRESS.md` again, and `src/query/patterns/triple.rs`.
++The source conflict is smaller than it looks. Columnar changes exactly two functions there:
++
++- `estimate_count` rewrites an `AE`/`AV` prefix onto the corresponding `AEV`/`AVE` segment prefix
++  and multiplies the key count by `segment_size`;
++- `create_iterator` returns a `SegmentIterator` instead of a `SlateIterator`/`TemporalFilterIterator`
++  for the four segmented index types.
++
++Both sides were kept as-is. Git's diff context overlapped because the batched code sits in the
++same file, not because the two features touch the same logic.
++
++**The merge is free, and that is the interesting part.** The batched path
++(`grouped_extensions`, `validate_grouped`, `count_batch`) does not open iterators itself — it
++calls the same `attr_var_pair_iterator` / `create_iterator` / `estimate_count` helpers the row
++engine calls. Swapping the storage layout underneath those helpers makes the batched engine
++columnar-aware without a line of new code. Neither feature has any knowledge of the other.
++
++`PROGRESS.md` conflicts were resolved by keeping this worktree's copy and moving each branch's
++`EXPERIMENT.md` / `PROGRESS.md` under `docs/`.
++
++## Attribution
++
++`benches/datalog_bench.rs`, VERTICES=2000, EDGE_PROB=0.01, 39764 edges, RUNS=5. Four arms —
++all off, each toggle alone, both on — interleaved in that order, three passes. `med` is the
++median of the three per-pass medians; `min` is the best of the three per-pass minima.
++JSON: `results/combo-vec-col-{off,batched,columnar,all}.json` in the session scratchpad.
++
++Two other agents were compiling on this machine throughout, so absolute milliseconds are worse
++than the recorded baseline and `three_hop_count` in particular swings by a factor of two between
++passes. Compare arms against each other, not against the baseline column.
++
++Median (ms), and each arm as a ratio of the all-off arm:
++
++| query | rows | off | batched | columnar | all | bat/off | col/off | all/off |
++|---|---:|---:|---:|---:|---:|---:|---:|---:|
++| triangles | 7821 | 547.9 | 321.2 | 407.8 | 191.3 | 0.59 | 0.74 | **0.35** |
++| two_hop_count | 1 | 245.9 | 180.3 | 168.6 | 97.6 | 0.73 | 0.69 | **0.40** |
++| three_hop_count | 1 | 10597 | 3805 | 11371 | 2659 | 0.36 | 1.07 | **0.25** |
++| out_degree | 2000 | 48.1 | 41.4 | 13.5 | 8.9 | 0.86 | 0.28 | **0.18** |
++| in_degree_top | 2000 | 49.1 | 41.2 | 13.9 | 9.2 | 0.84 | 0.28 | **0.19** |
++| neighbors_of_42 | 21 | 1.27 | 1.24 | 0.07 | 0.07 | 0.98 | 0.06 | **0.06** |
++| weight_filter | 198 | 4.03 | 3.11 | 1.32 | 0.68 | 0.77 | 0.33 | **0.17** |
++| weight_sum | 1 | 3.98 | 3.19 | 1.23 | 0.74 | 0.80 | 0.31 | **0.19** |
++| heavy_neighbors | 1908 | 77.4 | 53.4 | 31.4 | 16.3 | 0.69 | 0.41 | **0.21** |
++| label_lookup | 1 | 0.04 | 0.02 | 0.03 | 0.03 | 0.47 | 0.86 | 0.69 |
++| ingest | — | 144.5 | 145.8 | 129.9 | 129.2 | 1.01 | 0.90 | 0.89 |
++
++`label_lookup` is a 20-40 µs query; its column is noise.
++
++Row counts are identical in all four arms and match the recorded baseline for all ten queries
++(triangles 7821, out_degree 2000, in_degree_top 2000, neighbors_of_42 21, weight_filter 198,
++heavy_neighbors 1908, the rest 1).
++
++### Do the gains compose?
++
++Yes, close to multiplicatively, on eight of the ten queries. `all/off` predicted from the two
++single-toggle ratios versus what was actually measured:
++
++| query | bat/off × col/off | all/off measured |
++|---|---:|---:|
++| triangles | 0.44 | 0.35 |
++| two_hop_count | 0.50 | 0.40 |
++| out_degree | 0.24 | 0.18 |
++| in_degree_top | 0.24 | 0.19 |
++| weight_filter | 0.25 | 0.17 |
++| weight_sum | 0.25 | 0.19 |
++| heavy_neighbors | 0.28 | 0.21 |
++| three_hop_count | 0.39 | 0.25 |
++
++The stack beats the product of the parts everywhere. That is not a mystery: both features remove
++work from the same query, and once one of them has removed its share the other's fixed overhead
++is a larger fraction of what remains. `neighbors_of_42` is the exception in the other direction —
++columnar alone already takes it to 0.06 and batching has nothing left to do at 21 rows.
++
++## The three_hop_count question
++
++The columnar branch reported `three_hop_count` regressing 1.25x, on the theory that each
++single-row seek into AEV decodes a whole 1024-datom segment to find one row.
++
++**Reproduced, and batching removes it.**
++
++| | med | min |
++|---|---:|---:|
++| columnar / off | 1.07 | 1.27 |
++| all / batched | **0.70** | **0.93** |
++
++Columnar on top of the row engine is a wash-to-regression (the median barely moves, the min is
++1.27x worse, matching the original 1.25x). Columnar on top of the *batched* engine costs nothing
++and by the median helps.
++
++The mechanism is visible in the code. `TriplePattern::grouped_extensions`
++(`src/query/patterns/triple.rs:688`) sorts the input rows by their bound value, then walks the
++groups in ascending key order through **one** iterator, seeking once per *distinct* key rather
++than once per row. `SegmentIterator::seek` (`src/iterator/segment_iterator.rs:255`) keeps the
++decoded segment and returns immediately when the current position is already at or past the
++target, so a run of ascending seeks that land in the same segment decodes it once.
++
++So the two features fix each other's weakness. The row engine's seek order is arbitrary, which is
++exactly the access pattern segments are worst at; the batched engine sorts, which is exactly the
++access pattern segments are best at. Sorting was added to avoid a `BTreeMap`, not to help
++storage — the benefit to the segment layout is a side effect.
++
++The caveat: `three_hop_count` is by far the noisiest query in the suite. Per-pass medians were
++off 10597/7387/12245, columnar 7772/12078/11371, batched 2044/3805/6597, all 2659/4629/2015. The
++`all` arm is the only one whose three passes agree with each other, which is itself weak evidence
++that the combination is doing less work rather than getting lucky.
++
++## Correctness
++
++Both equivalence tests from the source branches are in the tree and run in every configuration:
++
++- `src/query/vectorized/tests.rs` — 10 queries through both engines, comparing variables and rows
++  exactly including order.
++- `src/segment_layout_test.rs::row_and_columnar_layouts_agree` — the same graph queried under both
++  layouts, current and as-of.
++
++`cargo test -p triplox`, four configurations:
++
++| toggles | result |
++|---|---|
++| none | **616 lib + 23 client_server + 3 fixture_compat + 6 subscription pass**, 0 failed |
++| `TRIPLOX_BATCHED_JOIN=1` | **all pass**, 0 failed |
++| `TRIPLOX_SEGMENT_LAYOUT=columnar` | 605 pass, **11 fail** |
++| both | 605 pass, **the same 11 fail** |
++
++`cargo clippy -p triplox --all-targets` is clean with toggles off and with both on.
++`cargo fmt --all --check` is clean.
++
++### The 11 failures
++
++The columnar branch documented ten env-sensitive unit tests. All ten still fail, and the list is
++unchanged:
++
++- seven `query::patterns::triple::tests::*` — six write raw row keys straight into SlateDB and read
++  back through the query engine; `count_applies_bound_term_estimate_to_each_duplicate_row` asserts
++  an exact key-count estimate that columnar deliberately multiplies by `segment_size`;
++- `indexer::tests::test_retract_on_overwrite` asserts a raw AE key exists, and columnar writes no AE;
++- `indexer::tests::test_lookup_tx_completion_committed` / `_aborted` pass `SegmentLayout::Row`
++  explicitly while the indexer under test reads the layout from the env.
++
++The eleventh is new to this tree, and it is the batched engine's own equivalence test:
++`query::vectorized::tests::batched_engine_matches_the_row_engine`, failing with
++`Pattern 0 failed during proposal: bad segment header`.
++
++It is the same harness artifact as the six above, not a disagreement between the engines. The
++test's `insert` helper (`src/query/vectorized/tests.rs:20`) writes AEV/AVE/AE/AV row keys with
++`slate.put` directly, bypassing the indexer, so under the columnar toggle the reader finds a row
++key where a segment header should be and the test errors out before it compares anything. It fails
++identically with `TRIPLOX_SEGMENT_LAYOUT=columnar` alone — the batched toggle is not involved,
++because the test constructs both engines itself regardless of the env. Nothing about the
++combination causes it; the count went 10 → 11 only because the merged tree contains one more test
++that seeds raw keys.
++
++Being honest about what that costs: under the columnar layout there is currently **no test**
++asserting the two engines produce identical rows. The evidence that they do is indirect —
++`row_and_columnar_layouts_agree` passes with `TRIPLOX_BATCHED_JOIN=1` (so the batched engine
++returns the same answers on both storage layouts), and every bench query returns identical row
++counts in all four arms. Making the seeding helpers layout-aware would close the gap and is the
++same day of work the columnar branch already scoped for its own ten.
++
++
++## Verdict
++
++Land both. They are independent in the code — neither feature's diff mentions the other, and the
++only place they meet is two helper functions in `triple.rs` that the batched engine was already
++calling — and complementary in the profile. Batching attacks per-row allocation in the join;
++segments attack key count and scan cost in storage. Together they take every query in the suite
++except a 20 µs point lookup to between 0.06x and 0.40x of the unmodified engine, with identical
++results.
++
++The one number the columnar branch flagged as a reason not to land it — `three_hop_count`
++regressing on deep pointer-chasing joins — is an artifact of the row engine's unsorted seek
++order, and disappears when the batched engine sorts the seeks. If the two are landed together,
++the per-segment first-column index the columnar branch proposed as a fix is not needed for this
++workload.
++
++What this experiment does *not* change about either branch's own list of remaining work: the
++batched engine still materializes each level in full and still falls back to the row engine for
++`relation` / `function` / `not` / `or`, and the segment layout is still an env var rather than
++persisted bootstrap metadata, which remains the thing to fix before either is exposed to a real
++database.
+diff --git a/PROGRESS.md b/PROGRESS.md
+index cfe2ad1..4f7561d 100644
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -14,8 +14,8 @@ Each source branch has an EXPERIMENT.md (design, toggle env var names, hook poin
+ 1. DONE: merges + cargo check.
+ 2. DONE: bench, 4 arms x 3 passes, interleaved. results/combo-vec-col-{off,batched,columnar,all}.json written. Row counts identical in all four arms and match baseline. Headline (median of 3 pass-medians, ms): triangles 548/321/408/191, three_hop 10597/3805/11371/2659, out_degree 48/41/13.5/8.9. all/off ranges 0.06-0.40 on everything except label_lookup (20us, noise).
+    three_hop: columnar alone regresses (1.07x median, 1.27x min); with batching on, adding columnar is neutral-to-better (all/batched 0.70 median, 0.93 min). The regression is gone under batching.
+-3. Equivalence tests from both branches; full suite off / all-on; clippy.
+-4. COMBINED.md.
++3. DONE: tests + clippy + fmt. off: all green (616 lib+23+3+6). batched alone: all green. columnar alone AND both: same 11 lib failures - the 10 the columnar branch documented, plus query::vectorized::tests::batched_engine_matches_the_row_engine, which is the same harness artifact (its insert() writes raw row keys with slate.put, so columnar reads 'bad segment header'). Caused by the columnar toggle alone; batching is not involved. clippy clean off and all-on; fmt clean.
++4. DONE: COMBINED.md written.
+ 
+ ## Shared context
+ 
+-- 
+2.51.2
+

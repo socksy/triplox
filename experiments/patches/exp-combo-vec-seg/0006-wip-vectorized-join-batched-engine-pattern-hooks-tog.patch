@@ -1,0 +1,1025 @@
+From f4ae728c1c64ae7bcbe661f1c89a8f64ed0281e3 Mon Sep 17 00:00:00 2001
+From: Ben Lovell <ben.j.lovell@gmail.com>
+Date: Thu, 3 Sep 2026 19:58:16 +0200
+Subject: [PATCH 06/20] wip(vectorized-join): batched engine, pattern hooks,
+ toggle, equivalence test
+
+---
+ PROGRESS.md                     |  25 +-
+ src/query.rs                    |  13 +-
+ src/query/exec_pattern.rs       |   7 +
+ src/query/patterns/predicate.rs |  63 ++++-
+ src/query/patterns/triple.rs    | 416 ++++++++++++++++++++++++++++++++
+ src/query/vectorized/batch.rs   |  29 +++
+ src/query/vectorized/engine.rs  | 143 +++++++++++
+ src/query/vectorized/mod.rs     |  42 ++++
+ src/query/vectorized/tests.rs   | 130 ++++++++++
+ 9 files changed, 857 insertions(+), 11 deletions(-)
+ create mode 100644 src/query/vectorized/engine.rs
+ create mode 100644 src/query/vectorized/mod.rs
+ create mode 100644 src/query/vectorized/tests.rs
+
+diff --git a/PROGRESS.md b/PROGRESS.md
+index d5d60b1..bafb15d 100644
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -54,16 +54,25 @@ So the columnar batch attacks the right thing: replace per-row `Vec<Bytes>` with
+ `Vec<u32>` parent-row map plus one `Vec<Bytes>` value column per level, and replace the
+ BTreeMap grouping with a sort of row indices.
+ 
+-### Code
+-- src/query/vectorized/batch.rs only (Batch with Own/Parent columns and row maps, ColumnView),
+-  not yet wired into the crate.
++### Code (built)
++- src/query/vectorized/batch.rs: Batch (Own/Parent columns, row maps), ColumnView, plus `concat`.
++- src/query/vectorized/mod.rs: `BatchPattern` trait (count_batch / propose_batch / validate_batch)
++  and `sorted_rows`.
++- src/query/vectorized/engine.rs: `BatchedJoinEngine` - same stage/proposal structure and the same
++  row ordering as `GenericJoinEngine`, columns instead of rows. `supports()` gates the path.
++- src/query/exec_pattern.rs: `ExecPattern::as_batch()` hook, default `None`.
++- src/query/patterns/triple.rs: `BatchPattern for TriplePattern`; grouping is a sort of row indices
++  instead of a `BTreeMap<&Bytes, Vec<usize>>`, extensions go into one value pool with per-row
++  ranges, `count_batch` estimates once per distinct key instead of once per row.
++- src/query/patterns/predicate.rs: `BatchPattern for PredicatePattern` (decodes through ColumnView).
++- src/query.rs: `TRIPLOX_BATCHED_JOIN` toggle in `execute_query`, falls back when unsupported.
++- src/query/vectorized/tests.rs: 10 queries run through both engines, rows compared exactly
++  (order included), plus a test that not/or is not claimed.
+ 
+ ## Next
+-1. Wire src/query/vectorized/mod.rs into the crate; write the batched engine for pure triple-pattern + predicate + aggregate queries first; fall back to the existing engine for not/or/rules.
+-2. Toggle + equivalence test on/off on a small graph.
+-3. cargo test -p triplox, clippy.
+-4. A/B bench; include the profile top-10 in EXPERIMENT.md.
+-5. EXPERIMENT.md, fmt, commit.
++1. cargo test -p triplox, clippy.
++2. A/B interleaved bench.
++3. EXPERIMENT.md, fmt, commit.
+ 
+ ### Environment note
+ The machine ran out of disk during this session (0 bytes free for a while; ~1.5 GiB free after).
+diff --git a/src/query.rs b/src/query.rs
+index e392c4e..7ca2c7f 100644
+--- a/src/query.rs
++++ b/src/query.rs
+@@ -6,6 +6,7 @@ pub(crate) mod exec_pattern;
+ pub(crate) mod patterns;
+ pub(crate) mod plan;
+ pub(crate) mod stage;
++pub(crate) mod vectorized;
+ 
+ use std::collections::hash_map::Entry;
+ use std::collections::{HashMap, HashSet};
+@@ -32,6 +33,7 @@ use crate::ops::{DataType, QueryArg};
+ use crate::query::binding_bag::{BindingBag, BindingRow};
+ use crate::query::engine::GenericJoinEngine;
+ use crate::query::plan::build_logical_plan;
++use crate::query::vectorized::engine::BatchedJoinEngine;
+ use crate::query_validation::validate_query;
+ use regex::Regex;
+ 
+@@ -729,6 +731,11 @@ fn resolve_limit(limit: &Limit, in_bindings: &[Binding], args: &[QueryArg]) -> L
+     }
+ }
+ 
++/// Opt-in columnar execution. Anything the batched engine does not cover falls back silently.
++fn batched_join_enabled() -> bool {
++    std::env::var("TRIPLOX_BATCHED_JOIN").is_ok_and(|value| value != "0" && !value.is_empty())
++}
++
+ /// Execute a query against the database.
+ pub fn execute_query<D, M>(
+     query: &ParsedQuery,
+@@ -743,7 +750,11 @@ where
+     let logical_plan = build_logical_plan(query, args)?;
+     let output_variables = logical_plan.output_variables().to_vec();
+     let stages = logical_plan.materialize(db, None)?;
+-    let bindings = GenericJoinEngine::execute(&stages, BindingBag::unit())?;
++    let bindings = if batched_join_enabled() && BatchedJoinEngine::supports(&stages) {
++        BatchedJoinEngine::execute(&stages)?
++    } else {
++        GenericJoinEngine::execute(&stages, BindingBag::unit())?
++    };
+     ensure!(
+         bindings.variables == output_variables,
+         "Query execution produced variables {:?}, expected {:?}",
+diff --git a/src/query/exec_pattern.rs b/src/query/exec_pattern.rs
+index 88be6dd..63ea5a3 100644
+--- a/src/query/exec_pattern.rs
++++ b/src/query/exec_pattern.rs
+@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
+ use edn::query::Variable;
+ 
+ use super::binding_bag::BindingBag;
++use super::vectorized::BatchPattern;
+ 
+ pub(crate) type PatternId = usize;
+ 
+@@ -65,6 +66,12 @@ pub(crate) trait ExecPattern: Send + Sync {
+         added: &[Variable],
+         target_variables: &[Variable],
+     ) -> Result<BindingBag>;
++
++    // Columnar implementation of this pattern, when it has one. `BatchedJoinEngine` runs a query
++    // only if every participant answers `Some`.
++    fn as_batch(&self) -> Option<&dyn BatchPattern> {
++        None
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/query/patterns/predicate.rs b/src/query/patterns/predicate.rs
+index ee8e34b..da8673a 100644
+--- a/src/query/patterns/predicate.rs
++++ b/src/query/patterns/predicate.rs
+@@ -1,13 +1,17 @@
+ use std::collections::HashMap;
+ 
+-use anyhow::{ensure, Result};
++use anyhow::{ensure, Context, Result};
++use bytes::Bytes;
+ use edn::query::Variable;
+ 
+ use super::evaluation::{binding_positions, update_bindings};
++use crate::codec::Decode;
+ use crate::expr::{evaluate_as_bool, expr_variables, EvalContext, Expr};
+ use crate::ops::DataType;
+ use crate::query::binding_bag::{BindingBag, BindingRow};
+-use crate::query::exec_pattern::{ExecPattern, PatternId};
++use crate::query::exec_pattern::{ExecPattern, PatternId, Proposal};
++use crate::query::vectorized::batch::Batch;
++use crate::query::vectorized::BatchPattern;
+ 
+ pub(crate) struct PredicatePattern {
+     id: PatternId,
+@@ -81,6 +85,61 @@ impl ExecPattern for PredicatePattern {
+         }
+         input.select_rows(&matches)
+     }
++
++    fn as_batch(&self) -> Option<&dyn BatchPattern> {
++        Some(self)
++    }
++}
++
++impl BatchPattern for PredicatePattern {
++    fn count_batch(
++        &self,
++        _batch: &Batch,
++        _added: &[Variable],
++        _proposals: &mut [Proposal],
++    ) -> Result<()> {
++        anyhow::bail!("Predicate pattern {} cannot propose", self.id)
++    }
++
++    fn propose_batch(&self, _batch: &Batch, added: &[Variable]) -> Result<(Vec<u32>, Vec<Bytes>)> {
++        anyhow::bail!(
++            "Predicate pattern {} cannot propose variables: {added:?}",
++            self.id
++        )
++    }
++
++    fn validate_batch(&self, batch: &Batch) -> Result<Vec<u32>> {
++        for variable in &self.variables {
++            ensure!(
++                batch.contains(variable),
++                "Predicate pattern {} requires bound variable {variable}",
++                self.id
++            );
++        }
++        let views = self
++            .variables
++            .iter()
++            .map(|variable| Ok((variable.clone(), batch.view_of(variable)?)))
++            .collect::<Result<Vec<_>>>()?;
++        let mut bindings = HashMap::with_capacity(views.len());
++        let mut matches = Vec::new();
++        for row in 0..batch.len() {
++            for (variable, view) in &views {
++                let value = DataType::decode(view.get(row))
++                    .with_context(|| format!("Failed to decode expression variable {variable}"))?;
++                match bindings.get_mut(variable) {
++                    Some(binding) => *binding = value,
++                    None => {
++                        bindings.insert(variable.clone(), value);
++                    }
++                }
++            }
++            if evaluate_as_bool(&self.expression, &EvalContext::new(&bindings)) {
++                matches.push(row as u32);
++            }
++        }
++        Ok(matches)
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/query/patterns/triple.rs b/src/query/patterns/triple.rs
+index fd0ac0d..5886435 100644
+--- a/src/query/patterns/triple.rs
++++ b/src/query/patterns/triple.rs
+@@ -13,6 +13,8 @@ use crate::iterator::slate_iterator::{Extractor, Index, SlateIterator};
+ use crate::iterator::temporal_filter_iterator::TemporalFilterIterator;
+ use crate::query::binding_bag::{BindingBag, BindingRow};
+ use crate::query::exec_pattern::{ExecPattern, PatternId, Proposal};
++use crate::query::vectorized::batch::{Batch, ColumnView};
++use crate::query::vectorized::{sorted_rows, BatchPattern};
+ use crate::util::make_extractor;
+ 
+ #[derive(Clone, Debug, Eq, PartialEq)]
+@@ -597,6 +599,420 @@ where
+             self.propose(input, added)?.reorder(target_variables)
+         }
+     }
++
++    fn as_batch(&self) -> Option<&dyn BatchPattern> {
++        Some(self)
++    }
++}
++
++// Walks `order` in runs of equal keys, which reproduces the ascending BTreeMap grouping the row
++// engine uses. `run` gets the first row of the group and all its rows, and returns false to stop
++// early once the underlying iterator is exhausted.
++fn for_each_group(
++    order: &[u32],
++    equal: impl Fn(u32, u32) -> bool,
++    mut run: impl FnMut(u32, &[u32]) -> Result<bool>,
++) -> Result<()> {
++    let mut start = 0;
++    while start < order.len() {
++        let mut end = start + 1;
++        while end < order.len() && equal(order[start], order[end]) {
++            end += 1;
++        }
++        if !run(order[start], &order[start..end])? {
++            break;
++        }
++        start = end;
++    }
++    Ok(())
++}
++
++fn ascending_rows(matches: &[bool]) -> Vec<u32> {
++    matches
++        .iter()
++        .enumerate()
++        .filter_map(|(row, matched)| matched.then_some(row as u32))
++        .collect()
++}
++
++impl<D, M> TriplePattern<D, M>
++where
++    D: DbReadOps + Send + Sync + 'static,
++    M: DbMetadataOps + Send + Sync + 'static,
++{
++    // Scans `iterator` for every distinct key of `view`, returning per-row `[start, end)` ranges
++    // into the returned value pool. Rows sharing a key share a range, so a group is scanned once
++    // and never copied.
++    fn grouped_extensions(
++        &self,
++        view: &ColumnView,
++        index_type: IndexType,
++    ) -> Result<(Vec<Bytes>, Vec<(u32, u32)>)> {
++        let order = sorted_rows(view.len(), |left, right| {
++            view.get(left as usize).cmp(view.get(right as usize))
++        });
++        let mut pool: Vec<Bytes> = Vec::new();
++        let mut ranges = vec![(0u32, 0u32); view.len()];
++        let mut iterator = self.attr_var_pair_iterator(index_type)?;
++        for_each_group(
++            &order,
++            |left, right| view.get(left as usize) == view.get(right as usize),
++            |key_row, rows| {
++                if !iterator.has_next() {
++                    return Ok(false);
++                }
++                let key = view.get(key_row as usize).clone();
++                iterator.seek(key.clone())?;
++                let start = pool.len() as u32;
++                while let Some(pair) = iterator.get_value()? {
++                    if !pair.starts_with(&key) {
++                        break;
++                    }
++                    pool.push(pair.slice(key.len()..));
++                    iterator.next()?;
++                }
++                let range = (start, pool.len() as u32);
++                for row in rows {
++                    ranges[*row as usize] = range;
++                }
++                Ok(true)
++            },
++        )?;
++        Ok((pool, ranges))
++    }
++
++    fn scan_all(&self, mut iterator: Box<dyn Index>) -> Result<Vec<Bytes>> {
++        let mut candidates = Vec::new();
++        while let Some(value) = iterator.get_value()? {
++            candidates.push(value);
++            iterator.next()?;
++        }
++        Ok(candidates)
++    }
++
++    fn constant_other_iterator(
++        &self,
++        index_type: IndexType,
++        constant: &Bytes,
++    ) -> Result<Box<dyn Index>> {
++        let mut prefix = self.base_prefix(index_type)?;
++        prefix.extend_from_slice(constant);
++        let prefix_len = prefix.len();
++        let extractor: Extractor =
++            Box::new(move |key| key.slice(prefix_len..key.len() - codec::TX_EID_OP_SUFFIX));
++        self.create_iterator(Bytes::from(prefix), index_type, extractor)
++    }
++
++    // One seek per distinct key, marking every row of the group.
++    fn validate_grouped(
++        &self,
++        batch: &Batch,
++        mut iterator: Box<dyn Index>,
++        key: impl Fn(u32) -> Bytes,
++        order: Vec<u32>,
++        equal: impl Fn(u32, u32) -> bool,
++    ) -> Result<Vec<bool>> {
++        let mut matches = vec![false; batch.len()];
++        for_each_group(&order, equal, |key_row, rows| {
++            if !iterator.has_next() {
++                return Ok(false);
++            }
++            let expected = key(key_row);
++            iterator.seek(expected.clone())?;
++            if iterator.get_value()?.as_ref() == Some(&expected) {
++                for row in rows {
++                    matches[*row as usize] = true;
++                }
++            }
++            Ok(true)
++        })?;
++        Ok(matches)
++    }
++
++    fn single_column_order(view: &ColumnView) -> (Vec<u32>, impl Fn(u32, u32) -> bool + '_) {
++        let order = sorted_rows(view.len(), |left, right| {
++            view.get(left as usize).cmp(view.get(right as usize))
++        });
++        (order, move |left: u32, right: u32| {
++            view.get(left as usize) == view.get(right as usize)
++        })
++    }
++}
++
++impl<D, M> BatchPattern for TriplePattern<D, M>
++where
++    D: DbReadOps + Send + Sync + 'static,
++    M: DbMetadataOps + Send + Sync + 'static,
++{
++    fn count_batch(
++        &self,
++        batch: &Batch,
++        added: &[Variable],
++        proposals: &mut [Proposal],
++    ) -> Result<()> {
++        ensure!(
++            proposals.len() == batch.len(),
++            "Triple pattern {} received {} proposals for {} input rows",
++            self.id,
++            proposals.len(),
++            batch.len()
++        );
++        ensure!(
++            added.len() == 1,
++            "Triple pattern {} can count exactly one variable, got {added:?}",
++            self.id
++        );
++        let Some(position) = self.position_for_variable(&added[0]) else {
++            let added = &added[0];
++            let vars = &self.variables;
++            bail!("Triple pattern can only count variables it can propose. Received {added}, variables {vars:?}")
++        };
++        if batch.is_empty() {
++            return Ok(());
++        }
++
++        let other = match position {
++            TriplePosition::Entity => &self.value,
++            TriplePosition::Value => &self.entity,
++        };
++        let other_resolved = match other {
++            TripleTerm::Variable(variable) => batch.contains(variable),
++            TripleTerm::Constant(_) => true,
++        };
++        let base_prefix = self.base_prefix(Self::index_type(position, other_resolved))?;
++
++        match other {
++            // One estimate per distinct bound value instead of one per row.
++            TripleTerm::Variable(other_var) if batch.contains(other_var) => {
++                let view = batch.view_of(other_var)?;
++                let (order, equal) = Self::single_column_order(&view);
++                for_each_group(&order, equal, |key_row, rows| {
++                    let mut prefix = base_prefix.clone();
++                    prefix.extend_from_slice(view.get(key_row as usize));
++                    let count = self.estimate_count(&prefix)?;
++                    for row in rows {
++                        proposals[*row as usize].consider(self.id, count);
++                    }
++                    Ok(true)
++                })?;
++            }
++            TripleTerm::Variable(_) => {
++                let count = self.estimate_count(&base_prefix)?;
++                for proposal in proposals.iter_mut() {
++                    proposal.consider(self.id, count);
++                }
++            }
++            TripleTerm::Constant(constant) => {
++                let mut prefix = base_prefix;
++                prefix.extend_from_slice(constant);
++                let count = self.estimate_count(&prefix)?;
++                for proposal in proposals.iter_mut() {
++                    proposal.consider(self.id, count);
++                }
++            }
++        }
++        Ok(())
++    }
++
++    fn propose_batch(&self, batch: &Batch, added: &[Variable]) -> Result<(Vec<u32>, Vec<Bytes>)> {
++        ensure!(
++            added.len() == 1,
++            "Triple pattern {} can propose exactly one variable, got {added:?}",
++            self.id
++        );
++        ensure!(
++            !batch.contains(&added[0]),
++            "Triple pattern {} cannot add already-bound variable {}",
++            self.id,
++            added[0]
++        );
++        let position = self.position_for_variable(&added[0]).ok_or_else(|| {
++            anyhow::anyhow!(
++                "Triple pattern {} cannot propose variable {}",
++                self.id,
++                added[0]
++            )
++        })?;
++        if batch.is_empty() {
++            return Ok((Vec::new(), Vec::new()));
++        }
++
++        let other = match position {
++            TriplePosition::Entity => &self.value,
++            TriplePosition::Value => &self.entity,
++        };
++        match other {
++            TripleTerm::Variable(other_var) if batch.contains(other_var) => {
++                let view = batch.view_of(other_var)?;
++                let (pool, ranges) =
++                    self.grouped_extensions(&view, Self::index_type(position, true))?;
++                let total = ranges
++                    .iter()
++                    .map(|(start, end)| (end - start) as usize)
++                    .sum();
++                let mut parent_rows = Vec::with_capacity(total);
++                let mut values = Vec::with_capacity(total);
++                for (row, (start, end)) in ranges.iter().enumerate() {
++                    for index in *start..*end {
++                        parent_rows.push(row as u32);
++                        values.push(pool[index as usize].clone());
++                    }
++                }
++                Ok((parent_rows, values))
++            }
++            other => {
++                let candidates = match other {
++                    TripleTerm::Constant(constant) => self.scan_all(
++                        self.constant_other_iterator(Self::index_type(position, true), constant)?,
++                    )?,
++                    TripleTerm::Variable(_) => {
++                        self.scan_all(self.attr_var_iterator(Self::index_type(position, false))?)?
++                    }
++                };
++                let total = batch.len() * candidates.len();
++                let mut parent_rows = Vec::with_capacity(total);
++                let mut values = Vec::with_capacity(total);
++                for row in 0..batch.len() as u32 {
++                    for candidate in &candidates {
++                        parent_rows.push(row);
++                        values.push(candidate.clone());
++                    }
++                }
++                Ok((parent_rows, values))
++            }
++        }
++    }
++
++    fn validate_batch(&self, batch: &Batch) -> Result<Vec<u32>> {
++        let is_bound = |variable| batch.contains(variable);
++        ensure!(
++            self.variables.is_empty() || self.variables.iter().any(&is_bound),
++            "Triple pattern {} has no bound variables to validate",
++            self.id
++        );
++        if batch.is_empty() {
++            return Ok(Vec::new());
++        }
++
++        let matches = match (&self.entity, &self.value) {
++            (TripleTerm::Constant(entity), TripleTerm::Constant(value)) => {
++                let mut prefix = self.base_prefix(IndexType::AEV)?;
++                prefix.extend_from_slice(entity);
++                let extractor: Extractor =
++                    Box::new(move |key| make_extractor(2, IndexType::AEV)(key));
++                let mut iterator =
++                    self.create_iterator(Bytes::from(prefix), IndexType::AEV, extractor)?;
++                let has_match = if iterator.has_next() {
++                    iterator.seek(value.clone())?;
++                    iterator.get_value()?.as_ref() == Some(value)
++                } else {
++                    false
++                };
++                vec![has_match; batch.len()]
++            }
++
++            (TripleTerm::Variable(entity_var), TripleTerm::Constant(value))
++                if is_bound(entity_var) =>
++            {
++                let mut prefix = self.base_prefix(IndexType::AVE)?;
++                prefix.extend_from_slice(value);
++                let extractor: Extractor =
++                    Box::new(move |key| make_extractor(2, IndexType::AVE)(key));
++                let iterator =
++                    self.create_iterator(Bytes::from(prefix), IndexType::AVE, extractor)?;
++                let view = batch.view_of(entity_var)?;
++                let (order, equal) = Self::single_column_order(&view);
++                self.validate_grouped(
++                    batch,
++                    iterator,
++                    |row| view.get(row as usize).clone(),
++                    order,
++                    equal,
++                )?
++            }
++
++            (TripleTerm::Constant(entity), TripleTerm::Variable(value_var))
++                if is_bound(value_var) =>
++            {
++                let mut prefix = self.base_prefix(IndexType::AEV)?;
++                prefix.extend_from_slice(entity);
++                let extractor: Extractor =
++                    Box::new(move |key| make_extractor(2, IndexType::AEV)(key));
++                let iterator =
++                    self.create_iterator(Bytes::from(prefix), IndexType::AEV, extractor)?;
++                let view = batch.view_of(value_var)?;
++                let (order, equal) = Self::single_column_order(&view);
++                self.validate_grouped(
++                    batch,
++                    iterator,
++                    |row| view.get(row as usize).clone(),
++                    order,
++                    equal,
++                )?
++            }
++
++            (TripleTerm::Variable(entity_var), TripleTerm::Variable(value_var))
++                if is_bound(entity_var) && !is_bound(value_var) =>
++            {
++                let iterator = self.attr_var_iterator(IndexType::AE)?;
++                let view = batch.view_of(entity_var)?;
++                let (order, equal) = Self::single_column_order(&view);
++                self.validate_grouped(
++                    batch,
++                    iterator,
++                    |row| view.get(row as usize).clone(),
++                    order,
++                    equal,
++                )?
++            }
++
++            (TripleTerm::Variable(entity_var), TripleTerm::Variable(value_var))
++                if !is_bound(entity_var) && is_bound(value_var) =>
++            {
++                let iterator = self.attr_var_iterator(IndexType::AV)?;
++                let view = batch.view_of(value_var)?;
++                let (order, equal) = Self::single_column_order(&view);
++                self.validate_grouped(
++                    batch,
++                    iterator,
++                    |row| view.get(row as usize).clone(),
++                    order,
++                    equal,
++                )?
++            }
++
++            (TripleTerm::Variable(entity_var), TripleTerm::Variable(value_var))
++                if is_bound(entity_var) && is_bound(value_var) =>
++            {
++                let iterator = self.attr_var_pair_iterator(IndexType::AEV)?;
++                let entity_view = batch.view_of(entity_var)?;
++                let value_view = batch.view_of(value_var)?;
++                // Grouping follows the row engine's tuple order, not concatenated-key order.
++                let key_of =
++                    |row: u32| (entity_view.get(row as usize), value_view.get(row as usize));
++                let order =
++                    sorted_rows(batch.len(), |left, right| key_of(left).cmp(&key_of(right)));
++                self.validate_grouped(
++                    batch,
++                    iterator,
++                    |row| {
++                        let (entity, value) = key_of(row);
++                        let mut expected = Vec::with_capacity(entity.len() + value.len());
++                        expected.extend_from_slice(entity);
++                        expected.extend_from_slice(value);
++                        Bytes::from(expected)
++                    },
++                    order,
++                    |left, right| key_of(left) == key_of(right),
++                )?
++            }
++            _ => bail!(
++                "Triple pattern {} has no bound variables to validate",
++                self.id
++            ),
++        };
++        Ok(ascending_rows(&matches))
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/query/vectorized/batch.rs b/src/query/vectorized/batch.rs
+index 897918c..bae5b18 100644
+--- a/src/query/vectorized/batch.rs
++++ b/src/query/vectorized/batch.rs
+@@ -191,6 +191,35 @@ impl Batch {
+         })
+     }
+ 
++    // Appends batches with identical layouts. Concatenation is the one operation that has to
++    // materialize columns, so it is only used for multi-proposer stages.
++    pub(crate) fn concat(variables: Vec<Variable>, batches: &[Arc<Batch>]) -> Result<Batch> {
++        for batch in batches {
++            ensure!(
++                batch.variables == variables,
++                "Concatenated batches must share a layout, got {:?} and {variables:?}",
++                batch.variables
++            );
++        }
++        let len = batches.iter().map(|batch| batch.len).sum();
++        let columns = (0..variables.len())
++            .map(|column| {
++                let mut values = Vec::with_capacity(len);
++                for batch in batches {
++                    let view = batch.view(column);
++                    values.extend((0..view.len()).map(|row| view.get(row).clone()));
++                }
++                Column::Own(Arc::new(values))
++            })
++            .collect();
++        Ok(Batch {
++            variables,
++            columns,
++            parent: None,
++            len,
++        })
++    }
++
+     pub(crate) fn chunks(self: &Arc<Self>, size: usize) -> Vec<Arc<Batch>> {
+         if self.len <= size {
+             return vec![Arc::clone(self)];
+diff --git a/src/query/vectorized/engine.rs b/src/query/vectorized/engine.rs
+new file mode 100644
+index 0000000..4a3be48
+--- /dev/null
++++ b/src/query/vectorized/engine.rs
+@@ -0,0 +1,143 @@
++use std::collections::HashMap;
++use std::sync::Arc;
++
++use anyhow::{ensure, Context, Result};
++
++use super::batch::Batch;
++use super::BatchPattern;
++use crate::query::binding_bag::BindingBag;
++use crate::query::exec_pattern::{PatternId, Proposal};
++use crate::query::stage::Stage;
++
++// Batched generic join. Same stage/proposal structure and the same row ordering as
++// `GenericJoinEngine`, but bindings live in columns with structural sharing instead of one
++// `Vec<Bytes>` per row.
++pub(crate) struct BatchedJoinEngine;
++
++impl BatchedJoinEngine {
++    // The batched path only exists for patterns that implement `BatchPattern`; anything else
++    // (not/or/rules/functions) falls back to the row engine.
++    pub(crate) fn supports(stages: &[Stage]) -> bool {
++        stages.iter().all(|stage| {
++            stage
++                .participants()
++                .iter()
++                .all(|participant| participant.as_batch().is_some())
++        })
++    }
++
++    fn batch_pattern(pattern: &dyn crate::query::exec_pattern::ExecPattern) -> &dyn BatchPattern {
++        pattern
++            .as_batch()
++            .expect("supports() checked every participant")
++    }
++
++    fn validate_all<'a>(
++        mut batch: Arc<Batch>,
++        validators: impl IntoIterator<Item = &'a dyn crate::query::exec_pattern::ExecPattern>,
++    ) -> Result<Arc<Batch>> {
++        for validator in validators {
++            let kept = Self::batch_pattern(validator)
++                .validate_batch(&batch)
++                .with_context(|| format!("Pattern {} failed during validation", validator.id()))?;
++            batch = Arc::new(batch.select(kept));
++        }
++        Ok(batch)
++    }
++
++    fn propose(
++        stage: &Stage,
++        proposer: &dyn crate::query::exec_pattern::ExecPattern,
++        input: &Arc<Batch>,
++    ) -> Result<Arc<Batch>> {
++        let added = stage.added();
++        ensure!(
++            added.len() == 1,
++            "Batched stages extend exactly one variable, got {added:?}"
++        );
++        let (parent_rows, values) = Self::batch_pattern(proposer)
++            .propose_batch(input, added)
++            .with_context(|| format!("Pattern {} failed during proposal", proposer.id()))?;
++        let extended = input.extend(parent_rows, added[0].clone(), values)?;
++        let reordered = extended.reorder(stage.target_variables())?;
++        let validators = stage
++            .participants()
++            .iter()
++            .filter(|participant| participant.id() != proposer.id())
++            .map(|participant| participant.as_ref());
++        Self::validate_all(Arc::new(reordered), validators)
++    }
++
++    fn execute_proposing_stage(stage: &Stage, input: &Arc<Batch>) -> Result<Arc<Batch>> {
++        if stage.proposers().len() == 1 {
++            let proposer = stage
++                .proposers()
++                .next()
++                .expect("proposing stages have at least one proposer");
++            return Self::propose(stage, proposer.as_ref(), input);
++        }
++
++        let mut proposals = vec![Proposal::default(); input.len()];
++        for proposer in stage.proposers() {
++            Self::batch_pattern(proposer.as_ref())
++                .count_batch(input, stage.added(), &mut proposals)
++                .with_context(|| {
++                    format!("Pattern {} failed while counting proposals", proposer.id())
++                })?;
++        }
++        let mut shards: HashMap<PatternId, Vec<u32>> = HashMap::new();
++        for (row, proposal) in proposals.iter().enumerate() {
++            let Some(proposer) = proposal.proposer() else {
++                continue;
++            };
++            shards.entry(proposer).or_default().push(row as u32);
++        }
++        let mut ordered_shards: Vec<_> = shards.into_iter().collect();
++        // Multi-proposer output is grouped by proposer in first-occurrence order.
++        ordered_shards.sort_unstable_by_key(|(_, rows)| rows[0]);
++
++        let mut results = Vec::with_capacity(ordered_shards.len());
++        for (proposer_id, rows) in ordered_shards {
++            let proposer = stage
++                .proposers()
++                .find(|proposer| proposer.id() == proposer_id)
++                .ok_or_else(|| anyhow::anyhow!("Unknown proposer id {proposer_id}"))?;
++            let shard = Arc::new(input.select(rows));
++            results.push(Self::propose(stage, proposer.as_ref(), &shard)?);
++        }
++        Ok(Arc::new(Batch::concat(
++            stage.target_variables().to_vec(),
++            &results,
++        )?))
++    }
++
++    fn execute_stage(stage: &Stage, input: &Arc<Batch>) -> Result<Arc<Batch>> {
++        let result = if stage.added().is_empty() {
++            let validated = Self::validate_all(
++                Arc::clone(input),
++                stage
++                    .participants()
++                    .iter()
++                    .map(|participant| participant.as_ref()),
++            )?;
++            Arc::new(validated.reorder(stage.target_variables())?)
++        } else {
++            Self::execute_proposing_stage(stage, input)?
++        };
++        ensure!(
++            result.variables == stage.target_variables(),
++            "Stage produced layout {:?}, expected {:?}",
++            result.variables,
++            stage.target_variables()
++        );
++        Ok(result)
++    }
++
++    pub(crate) fn execute(stages: &[Stage]) -> Result<BindingBag> {
++        let mut batch = Arc::new(Batch::unit());
++        for stage in stages {
++            batch = Self::execute_stage(stage, &batch)?;
++        }
++        batch.to_binding_bag()
++    }
++}
+diff --git a/src/query/vectorized/mod.rs b/src/query/vectorized/mod.rs
+new file mode 100644
+index 0000000..dac9feb
+--- /dev/null
++++ b/src/query/vectorized/mod.rs
+@@ -0,0 +1,42 @@
++pub(crate) mod batch;
++pub(crate) mod engine;
++
++#[cfg(test)]
++mod tests;
++
++use anyhow::Result;
++use bytes::Bytes;
++use edn::query::Variable;
++
++use crate::query::exec_pattern::Proposal;
++use batch::Batch;
++
++// Columnar counterpart of `ExecPattern`. A pattern that implements it can run inside the batched
++// engine, which never materializes intermediate rows: proposals come back as a parent-row map plus
++// a value column, and validation comes back as the row indices to keep.
++pub(crate) trait BatchPattern: Send + Sync {
++    // Same contract as `ExecPattern::count`.
++    fn count_batch(
++        &self,
++        batch: &Batch,
++        added: &[Variable],
++        proposals: &mut [Proposal],
++    ) -> Result<()>;
++
++    // Extends `batch` by one variable. `parent_rows` is ascending and pairs positionally with
++    // `values`, so `(parent_rows[i], values[i])` is one output row.
++    fn propose_batch(&self, batch: &Batch, added: &[Variable]) -> Result<(Vec<u32>, Vec<Bytes>)>;
++
++    // Row indices of `batch` that satisfy this pattern, ascending.
++    fn validate_batch(&self, batch: &Batch) -> Result<Vec<u32>>;
++}
++
++// Row indices of `len` rows ordered by `compare`, which is a total order over row indices.
++pub(crate) fn sorted_rows(
++    len: usize,
++    compare: impl Fn(u32, u32) -> std::cmp::Ordering,
++) -> Vec<u32> {
++    let mut order: Vec<u32> = (0..len as u32).collect();
++    order.sort_unstable_by(|left, right| compare(*left, *right));
++    order
++}
+diff --git a/src/query/vectorized/tests.rs b/src/query/vectorized/tests.rs
+new file mode 100644
+index 0000000..f09997a
+--- /dev/null
++++ b/src/query/vectorized/tests.rs
+@@ -0,0 +1,130 @@
++use std::collections::HashMap;
++
++use anyhow::Result;
++use edn::kw;
++use slatedb::Db;
++
++use crate::codec::{self, Encode};
++use crate::ops::DataType;
++use crate::partition::tx_eid_from_tx_id;
++use crate::query::binding_bag::BindingBag;
++use crate::query::engine::GenericJoinEngine;
++use crate::query::plan::build_logical_plan;
++use crate::query::test_support::db_at_tx_id;
++use crate::query::vectorized::engine::BatchedJoinEngine;
++use crate::slate::in_memory_slate;
++
++const TO: i64 = 100;
++const WEIGHT: i64 = 101;
++
++async fn insert(slate: &Db, attribute: i64, entity: i64, value: &DataType, tx_id: i64) {
++    let tx_eid = codec::encode_i64_bytes(tx_eid_from_tx_id(tx_id));
++    let attribute = codec::encode_i64_bytes(attribute);
++    let entity = DataType::Long(entity).encode();
++    let value = value.encode();
++
++    for (prefix, first, second) in [(codec::AEV, &entity, &value), (codec::AVE, &value, &entity)] {
++        let mut key = vec![prefix];
++        key.extend_from_slice(&attribute);
++        key.extend_from_slice(first);
++        key.extend_from_slice(second);
++        key.extend_from_slice(&tx_eid);
++        key.push(codec::ADD);
++        slate.put(&key, b"").await.expect("put");
++    }
++    for (prefix, component) in [(codec::AE, &entity), (codec::AV, &value)] {
++        let mut key = vec![prefix];
++        key.extend_from_slice(&attribute);
++        key.extend_from_slice(component);
++        slate.put(&key, b"").await.expect("put");
++    }
++}
++
++// Six vertices, a handful of triangles, and weights so predicates have something to filter.
++async fn seed(slate: &Db) {
++    let edges = [
++        (1, 2),
++        (1, 3),
++        (1, 4),
++        (2, 3),
++        (2, 4),
++        (3, 4),
++        (4, 5),
++        (5, 1),
++        (5, 6),
++        (6, 1),
++    ];
++    for (from, to) in edges {
++        insert(slate, TO, from, &DataType::Long(to), 10).await;
++    }
++    for entity in 1..=6 {
++        // Repeating weights let a pattern bind the same value on both endpoints of an edge.
++        insert(
++            slate,
++            WEIGHT,
++            entity,
++            &DataType::Long((entity % 3) * 20 + 5),
++            10,
++        )
++        .await;
++    }
++}
++
++const QUERIES: &[&str] = &[
++    "[:find ?a ?b :where [?a :g/to ?b]]",
++    "[:find ?a ?b ?c :where [?a :g/to ?b] [?b :g/to ?c] [?a :g/to ?c]]",
++    "[:find ?a ?b ?c :where [?a :g/to ?b] [?b :g/to ?c]]",
++    "[:find ?a (count ?b) :where [?a :g/to ?b]]",
++    "[:find (sum ?w) :where [?e :g/weight ?w]]",
++    "[:find ?e :where [?e :g/weight ?w] [(> ?w 25)]]",
++    "[:find ?a ?b :where [?a :g/to ?b] [?b :g/weight ?w] [(> ?w 25)]]",
++    "[:find ?e :where [?e :g/weight 25]]",
++    "[:find ?b :where [?a :g/weight 25] [?a :g/to ?b]]",
++    "[:find ?a ?b ?w :where [?a :g/to ?b] [?a :g/weight ?w] [?b :g/weight ?w]]",
++];
++
++#[test]
++fn batched_engine_matches_the_row_engine() -> Result<()> {
++    let runtime = tokio::runtime::Runtime::new()?;
++    let components = runtime.block_on(in_memory_slate());
++    runtime.block_on(seed(components.db.as_ref()));
++    let idents = HashMap::from([(kw!(:g/to), TO), (kw!(:g/weight), WEIGHT)]);
++
++    for query in QUERIES {
++        let parsed = edn::parse::parse_query(query).expect("parse");
++        let logical = build_logical_plan(&parsed, &[])?;
++        let db = db_at_tx_id(&components, runtime.handle(), idents.clone(), 20);
++        let stages = logical.materialize(db, None)?;
++
++        assert!(
++            BatchedJoinEngine::supports(&stages),
++            "{query} should run on the batched engine"
++        );
++        let rows = GenericJoinEngine::execute(&stages, BindingBag::unit())?;
++        let batched = BatchedJoinEngine::execute(&stages)?;
++
++        assert_eq!(batched.variables, rows.variables, "layout for {query}");
++        assert_eq!(batched.rows, rows.rows, "rows for {query}");
++        assert!(!rows.rows.is_empty(), "{query} produced no rows to compare");
++    }
++    Ok(())
++}
++
++#[test]
++fn unsupported_patterns_are_not_claimed_by_the_batched_engine() -> Result<()> {
++    let runtime = tokio::runtime::Runtime::new()?;
++    let components = runtime.block_on(in_memory_slate());
++    let parsed =
++        edn::parse::parse_query("[:find ?x :in [?x ...] :where (not (or [(= ?x 2)] [(= ?x 3)]))]")
++            .expect("parse");
++    let arguments = [crate::ops::QueryArg::Collection(vec![
++        DataType::Long(1),
++        DataType::Long(2),
++    ])];
++    let logical = build_logical_plan(&parsed, &arguments)?;
++    let db = db_at_tx_id(&components, runtime.handle(), HashMap::new(), 20);
++    let stages = logical.materialize(db, None)?;
++
++    assert!(!BatchedJoinEngine::supports(&stages));
++    Ok(())
++}
+-- 
+2.51.2
+

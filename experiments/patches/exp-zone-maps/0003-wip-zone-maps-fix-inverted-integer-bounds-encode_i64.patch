@@ -1,0 +1,463 @@
+From a1eb080723e3ea89791be8b520d9b15996969a4f Mon Sep 17 00:00:00 2001
+From: Ben Lovell <ben.j.lovell@gmail.com>
+Date: Thu, 3 Sep 2026 19:59:10 +0200
+Subject: [PATCH 3/7] wip(zone-maps): fix inverted integer bounds (encode_i64
+ is order-reversing); zone_map tests 8/8
+
+---
+ PROGRESS.md                  |  41 +++---
+ src/query/patterns/triple.rs |   5 +-
+ src/zone_map.rs              | 233 +++++++++++++++++++++++++----------
+ 3 files changed, 195 insertions(+), 84 deletions(-)
+
+diff --git a/PROGRESS.md b/PROGRESS.md
+index e14760d..9f8ef4e 100644
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -3,28 +3,29 @@
+ ## Goal
+ Per-run (RUN_SIZE keys in key order) min/max of the non-prefix component (V for AEV, E for AVE) plus oldest/newest tx id, per (index, attribute), built in memory by scanning the prefix and cached per basis (sound for any basis <= build basis, see module doc). Planner pushes comparison predicates on a single-pattern variable into the scan as V bounds; iterators skip runs. Toggle: TRIPLOX_ZONE_MAPS=1. Also measure an as-of query at an early basis.
+ 
+-## Status (as of hand-off)
+-- Compiles clean (`cargo check -p triplox --lib --tests`, `cargo check --all-targets`).
+-- Plumbing is complete: planner pushdown (src/query/plan.rs), AEV per-entity seek pruning and
+-  AV sorted-scan seek/early-exit (src/query/patterns/triple.rs), temporal run skipping
+-  (src/iterator/temporal_filter_iterator.rs), cache on SlateComponents (src/slate/mod.rs).
+-- New tests in src/zone_map.rs: `results_match_with_zone_maps_on_and_off` (10 queries x
+-  {latest, as-of} x {cold cache, warm cache}) and `zone_map_prunes_and_counts_skips`
+-  (asserts seeks_checked > 0 and seeks_skipped > 0). NOT YET RUN - see disk note.
+-
+-### MACHINE DISK IS FULL (blocking)
+-`/` fluctuates between ~145Mi and ~4Gi free; five agents share it. `cargo test` and
+-`cargo bench` builds fail with ENOSPC mid-link. I deleted only this worktree's
+-`target/release` (never `cargo clean`). Do not touch other worktrees' targets.
+-Strategy: wait for free space with a background monitor, then build in this order -
+-(1) `cargo test -p triplox --lib`, (2) `cargo clippy`, (3) `cargo bench` (release, biggest).
++## Status
++- BUG FOUND AND FIXED: `codec::encode_i64` is `value ^ i64::MAX`, which is strictly order
++  *reversing*, so Long/BigInt/Instant sort DESCENDING in index keys (floats and strings sort
++  ascending). The handed-over `ValueBounds` compared raw bytes assuming ascending order, so
++  every integer bound was inverted. `ValueBounds` now carries a per-type-tag `Direction` and
++  compares in value order; the AV sorted-scan path uses `seek_target`/`past_byte_end`, which
++  pick the upper bound as the seek target for descending encodings.
++- `cargo test -p triplox --lib zone_map`: 8/8 pass, including
++  `results_match_with_zone_maps_on_and_off` (10 queries x {latest, as-of} x {cold, warm cache})
++  and `zone_map_prunes_and_counts_skips`.
++- KEY LIMITATION found: run pruning only fires when values correlate with key order. With
++  values scattered across the whole domain every run spans the whole range and nothing prunes.
++  The bench's `:g/weight = i % 1000` does correlate with entity id, so it prunes.
++
++### MACHINE DISK
++`/` swings between ~145Mi and ~32Gi free; five agents share it. Builds fail with ENOSPC
++mid-link when it is low; just retry. I deleted only this worktree's `target/release`.
++`target/tmp/retry_tests.sh <log> <cmd...>` waits for headroom and retries on ENOSPC.
+ 
+ ## Next
+-1. Verify pushdown and run-skipping work end to end (skip counters > 0 on weight_filter, rows still 198).
+-2. Equivalence test on/off including >= vs > boundaries and an as-of query.
+-3. cargo test -p triplox, clippy.
+-4. A/B bench; report skipped runs per query; add an as-of query to your own runs.
+-5. EXPERIMENT.md (include interaction with a future segment layout), fmt, commit.
++1. `cargo test -p triplox` (full), `cargo clippy -p triplox --all-targets`.
++2. A/B interleaved bench, 3 runs each, ASOF=1; write the two JSON files.
++3. EXPERIMENT.md, `cargo fmt`, commit.
+ 
+ ## Shared context
+ 
+diff --git a/src/query/patterns/triple.rs b/src/query/patterns/triple.rs
+index 663455a..3000083 100644
+--- a/src/query/patterns/triple.rs
++++ b/src/query/patterns/triple.rs
+@@ -260,7 +260,8 @@ where
+                     TriplePosition::Value => self.value_bounds.as_ref(),
+                     TriplePosition::Entity => None,
+                 };
+-                // AV is sorted by value, so a lower bound is a seek and an upper bound ends the scan.
++                // The AV index is sorted by encoded value, so one bound becomes a seek and
++                // the other ends the scan (which is which depends on the encoding direction).
+                 if let (Some(bounds), Some(first)) = (bounds, iterator.get_value()?) {
+                     if let Some(target) = bounds.seek_target(&first) {
+                         iterator.seek(target.clone())?;
+@@ -269,7 +270,7 @@ where
+                 let mut candidates = Vec::new();
+                 while let Some(value) = iterator.get_value()? {
+                     if let Some(bounds) = bounds {
+-                        if bounds.above_upper(&value) {
++                        if bounds.past_byte_end(&value) {
+                             break;
+                         }
+                         if bounds.excludes(&value) {
+diff --git a/src/zone_map.rs b/src/zone_map.rs
+index fba02ec..db57c11 100644
+--- a/src/zone_map.rs
++++ b/src/zone_map.rs
+@@ -22,6 +22,7 @@ use slatedb::DbReadOps;
+ use tokio::runtime::Handle;
+ 
+ use crate::codec;
++use crate::protocol::{TAG_BIG_INT, TAG_DOUBLE, TAG_FLOAT, TAG_INSTANT, TAG_LONG, TAG_STRING};
+ use crate::slate::DEFAULT_SCAN_OPTIONS;
+ 
+ pub const RUN_SIZE: usize = 256;
+@@ -87,9 +88,9 @@ pub(crate) struct Bound {
+     pub inclusive: bool,
+ }
+ 
+-/// Encoded-value bounds on the V position of one triple pattern. Encodings are
+-/// order preserving within a type, so comparisons only apply when the type tag
+-/// (first byte) matches; otherwise the bound is ignored.
++/// Encoded-value bounds on the V position of one triple pattern. Comparisons are
++/// only meaningful between encodings of the same type, so a bound is ignored
++/// unless the value's type tag matches and that tag has a known byte order.
+ #[derive(Clone, Debug, Default, PartialEq, Eq)]
+ pub(crate) struct ValueBounds {
+     pub lower: Option<Bound>,
+@@ -100,17 +101,52 @@ fn tag(encoded: &[u8]) -> Option<u8> {
+     encoded.first().copied()
+ }
+ 
++/// How an encoding's byte order relates to the type's own order. `encode_i64`
++/// XORs with `i64::MAX`, which is strictly order *reversing* over the whole
++/// range, so integers and instants sort descending in index keys; floats and
++/// strings sort ascending.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Direction {
++    Ascending,
++    Descending,
++}
++
++fn direction(tag: u8) -> Option<Direction> {
++    match tag {
++        TAG_LONG | TAG_BIG_INT | TAG_INSTANT => Some(Direction::Descending),
++        TAG_DOUBLE | TAG_FLOAT | TAG_STRING => Some(Direction::Ascending),
++        _ => None,
++    }
++}
++
+ impl ValueBounds {
+     pub(crate) fn is_empty(&self) -> bool {
+         self.lower.is_none() && self.upper.is_none()
+     }
+ 
++    /// Order of two same-type encoded values in the type's own order, or `None`
++    /// when the tags differ or the encoding's direction is unknown.
++    fn value_cmp(left: &[u8], right: &[u8]) -> Option<std::cmp::Ordering> {
++        let left_tag = tag(left)?;
++        if tag(right) != Some(left_tag) {
++            return None;
++        }
++        let raw = left.cmp(right);
++        Some(match direction(left_tag)? {
++            Direction::Ascending => raw,
++            Direction::Descending => raw.reverse(),
++        })
++    }
++
+     // Keep the tighter of two bounds of the same type; otherwise keep the existing one.
+     fn tighten(existing: &mut Option<Bound>, candidate: Bound, keep_greater: bool) {
+         match existing {
+             None => *existing = Some(candidate),
+-            Some(current) if tag(&current.value) == tag(&candidate.value) => {
+-                let replace = match candidate.value.cmp(&current.value) {
++            Some(current) => {
++                let Some(order) = Self::value_cmp(&candidate.value, &current.value) else {
++                    return;
++                };
++                let replace = match order {
+                     std::cmp::Ordering::Greater => keep_greater,
+                     std::cmp::Ordering::Less => !keep_greater,
+                     std::cmp::Ordering::Equal => !candidate.inclusive,
+@@ -119,7 +155,6 @@ impl ValueBounds {
+                     *current = candidate;
+                 }
+             }
+-            Some(_) => {}
+         }
+     }
+ 
+@@ -131,29 +166,28 @@ impl ValueBounds {
+         Self::tighten(&mut self.upper, Bound { value, inclusive }, false);
+     }
+ 
+-    /// True when the bound's type tag equals `encoded`'s, i.e. byte comparison is meaningful.
+-    fn comparable(bound: &Bound, encoded: &[u8]) -> bool {
+-        tag(&bound.value) == tag(encoded)
+-    }
+-
+-    /// Whether a run whose V values span `[min_v, max_v]` may contain a matching value.
+-    pub(crate) fn run_may_match(&self, min_v: &[u8], max_v: &[u8]) -> bool {
++    /// Whether a run whose encoded values span the byte range `[byte_min, byte_max]`
++    /// may contain a matching value.
++    pub(crate) fn run_may_match(&self, byte_min: &[u8], byte_max: &[u8]) -> bool {
++        // Under a descending encoding the byte extremes are the value extremes swapped.
++        let descending = tag(byte_min).and_then(direction) == Some(Direction::Descending);
++        let (value_min, value_max) = if descending {
++            (byte_max, byte_min)
++        } else {
++            (byte_min, byte_max)
++        };
+         if let Some(lower) = &self.lower {
+-            if Self::comparable(lower, max_v) {
+-                match max_v.cmp(lower.value.as_ref()) {
+-                    std::cmp::Ordering::Less => return false,
+-                    std::cmp::Ordering::Equal if !lower.inclusive => return false,
+-                    _ => {}
+-                }
++            match Self::value_cmp(value_max, &lower.value) {
++                Some(std::cmp::Ordering::Less) => return false,
++                Some(std::cmp::Ordering::Equal) if !lower.inclusive => return false,
++                _ => {}
+             }
+         }
+         if let Some(upper) = &self.upper {
+-            if Self::comparable(upper, min_v) {
+-                match min_v.cmp(upper.value.as_ref()) {
+-                    std::cmp::Ordering::Greater => return false,
+-                    std::cmp::Ordering::Equal if !upper.inclusive => return false,
+-                    _ => {}
+-                }
++            match Self::value_cmp(value_min, &upper.value) {
++                Some(std::cmp::Ordering::Greater) => return false,
++                Some(std::cmp::Ordering::Equal) if !upper.inclusive => return false,
++                _ => {}
+             }
+         }
+         true
+@@ -164,24 +198,39 @@ impl ValueBounds {
+         !self.run_may_match(encoded, encoded)
+     }
+ 
+-    /// Whether `encoded` lies above the upper bound (same type only).
+-    pub(crate) fn above_upper(&self, encoded: &[u8]) -> bool {
+-        match &self.upper {
+-            Some(upper) if Self::comparable(upper, encoded) => match encoded.cmp(&upper.value) {
++    /// The bound a byte-ordered scan reaches first, i.e. where it should start.
++    fn byte_start_bound(&self, tag_source: &[u8]) -> Option<&Bound> {
++        let bound = match tag(tag_source).and_then(direction)? {
++            Direction::Ascending => self.lower.as_ref(),
++            Direction::Descending => self.upper.as_ref(),
++        }?;
++        (tag(&bound.value) == tag(tag_source)).then_some(bound)
++    }
++
++    /// The bound a byte-ordered scan reaches last, i.e. where it should stop.
++    fn byte_end_bound(&self, tag_source: &[u8]) -> Option<&Bound> {
++        let bound = match tag(tag_source).and_then(direction)? {
++            Direction::Ascending => self.upper.as_ref(),
++            Direction::Descending => self.lower.as_ref(),
++        }?;
++        (tag(&bound.value) == tag(tag_source)).then_some(bound)
++    }
++
++    /// Whether a byte-ordered scan has passed the last value that can match.
++    pub(crate) fn past_byte_end(&self, encoded: &[u8]) -> bool {
++        match self.byte_end_bound(encoded) {
++            Some(end) => match encoded.cmp(&end.value) {
+                 std::cmp::Ordering::Greater => true,
+-                std::cmp::Ordering::Equal => !upper.inclusive,
++                std::cmp::Ordering::Equal => !end.inclusive,
+                 std::cmp::Ordering::Less => false,
+             },
+-            _ => false,
++            None => false,
+         }
+     }
+ 
+-    /// Seek target for a sorted scan of values with the same type tag as `first_value`.
++    /// Seek target for a byte-ordered scan of values with `first_value`'s type tag.
+     pub(crate) fn seek_target(&self, first_value: &[u8]) -> Option<&Bytes> {
+-        match &self.lower {
+-            Some(lower) if Self::comparable(lower, first_value) => Some(&lower.value),
+-            _ => None,
+-        }
++        self.byte_start_bound(first_value).map(|bound| &bound.value)
+     }
+ }
+ 
+@@ -395,27 +444,66 @@ mod tests {
+         Bytes::from(DataType::Long(value).encode())
+     }
+ 
++    /// Byte extremes of a run holding `values`, as `ZoneMap::build` records them.
++    fn run(values: &[i64]) -> (Bytes, Bytes) {
++        let mut encoded: Vec<Bytes> = values.iter().copied().map(enc).collect();
++        encoded.sort();
++        (encoded[0].clone(), encoded[encoded.len() - 1].clone())
++    }
++
++    fn may_match(bounds: &ValueBounds, values: &[i64]) -> bool {
++        let (byte_min, byte_max) = run(values);
++        bounds.run_may_match(&byte_min, &byte_max)
++    }
++
++    // Long keys are encoded with `value ^ i64::MAX`, so their byte order is the
++    // reverse of their numeric order; the bounds must not assume ascending bytes.
++    #[test]
++    fn long_encoding_is_order_reversing() {
++        assert!(enc(901) < enc(900));
++        assert!(enc(0) < enc(-1));
++        assert!(enc(i64::MAX) < enc(i64::MIN));
++    }
++
+     #[test]
+     fn bounds_prune_runs_at_boundaries() {
+         let mut gt = ValueBounds::default();
+         gt.add_lower(enc(900), false);
+-        assert!(!gt.run_may_match(&enc(0), &enc(900)));
+-        assert!(gt.run_may_match(&enc(0), &enc(901)));
++        assert!(!may_match(&gt, &[0, 900]));
++        assert!(may_match(&gt, &[0, 901]));
+ 
+         let mut ge = ValueBounds::default();
+         ge.add_lower(enc(900), true);
+-        assert!(ge.run_may_match(&enc(0), &enc(900)));
+-        assert!(!ge.run_may_match(&enc(0), &enc(899)));
++        assert!(may_match(&ge, &[0, 900]));
++        assert!(!may_match(&ge, &[0, 899]));
+ 
+         let mut lt = ValueBounds::default();
+         lt.add_upper(enc(10), false);
+-        assert!(!lt.run_may_match(&enc(10), &enc(20)));
+-        assert!(lt.run_may_match(&enc(9), &enc(20)));
++        assert!(!may_match(&lt, &[10, 20]));
++        assert!(may_match(&lt, &[9, 20]));
+ 
+         let mut le = ValueBounds::default();
+         le.add_upper(enc(10), true);
+-        assert!(le.run_may_match(&enc(10), &enc(20)));
+-        assert!(!le.run_may_match(&enc(11), &enc(20)));
++        assert!(may_match(&le, &[10, 20]));
++        assert!(!may_match(&le, &[11, 20]));
++
++        let mut window = ValueBounds::default();
++        window.add_lower(enc(100), true);
++        window.add_upper(enc(200), false);
++        assert!(may_match(&window, &[150, 150]));
++        assert!(!may_match(&window, &[200, 300]));
++        assert!(!may_match(&window, &[0, 99]));
++        assert!(may_match(&window, &[0, 300]));
++    }
++
++    #[test]
++    fn bounds_handle_negative_values() {
++        let mut gt = ValueBounds::default();
++        gt.add_lower(enc(-1), false);
++        assert!(!may_match(&gt, &[-10, -1]));
++        assert!(may_match(&gt, &[-10, 0]));
++        assert!(gt.excludes(&enc(-1)));
++        assert!(!gt.excludes(&enc(0)));
+     }
+ 
+     #[test]
+@@ -443,9 +531,34 @@ mod tests {
+         assert_eq!(b.upper.as_ref().unwrap().value, enc(20));
+     }
+ 
++    // For a descending encoding the scan starts at the upper bound and stops at the lower.
++    #[test]
++    fn byte_scan_bounds_follow_the_encoding_direction() {
++        let mut long = ValueBounds::default();
++        long.add_lower(enc(900), false);
++        long.add_upper(enc(950), true);
++        assert_eq!(long.seek_target(&enc(0)), Some(&enc(950)));
++        assert!(!long.past_byte_end(&enc(901)));
++        assert!(long.past_byte_end(&enc(900)));
++        assert!(long.past_byte_end(&enc(899)));
++
++        let text = |v: &str| Bytes::from(DataType::String(v.into()).encode());
++        let mut string = ValueBounds::default();
++        string.add_lower(text("m"), true);
++        string.add_upper(text("q"), false);
++        assert_eq!(string.seek_target(&text("a")), Some(&text("m")));
++        assert!(!string.past_byte_end(&text("p")));
++        assert!(string.past_byte_end(&text("q")));
++    }
++
+     // The toggle is process-wide, so the on/off tests take turns.
+     static TOGGLE: Mutex<()> = Mutex::new(());
+ 
++    // Ages spread across 0..300 so a run's value range covers almost everything.
++    fn scattered(index: i64) -> i64 {
++        (index * 7) % 300
++    }
++
+     const EQUIVALENCE_QUERIES: &[&str] = &[
+         "[:find ?e :where [?e :age ?a] [(> ?a 200)]]",
+         "[:find ?e :where [?e :age ?a] [(>= ?a 200)]]",
+@@ -468,9 +581,9 @@ mod tests {
+         }
+     }
+ 
+-    /// 600 entities with `:age` cycling through 0..300 so an AEV run boundary
+-    /// (RUN_SIZE = 256) falls inside the attribute and runs overlap in value.
+-    async fn seeded_node() -> (Node<MemoryLog>, TxKey) {
++    /// 600 entities, so an AEV run boundary (RUN_SIZE = 256) falls inside the
++    /// attribute. `age` maps an entity's insertion index to its `:age` value.
++    async fn seeded_node(age: impl Fn(i64) -> i64) -> (Node<MemoryLog>, TxKey) {
+         let node = Node::memory_node().await;
+         commit(&node, test_schema_tx()).await;
+         let mut early = None;
+@@ -482,7 +595,7 @@ mod tests {
+                         TxOp::Add {
+                             entity: format!("e{index}").into(),
+                             attribute: kw!(:age),
+-                            value: DataType::Long((index * 7) % 300),
++                            value: DataType::Long(age(index)),
+                         },
+                         TxOp::Add {
+                             entity: format!("e{index}").into(),
+@@ -517,16 +630,16 @@ mod tests {
+ 
+     #[tokio::test(flavor = "multi_thread")]
+     async fn results_match_with_zone_maps_on_and_off() {
+-        let _guard = TOGGLE.lock().unwrap();
++        let _guard = TOGGLE.lock().unwrap_or_else(|error| error.into_inner());
+         let previous = enabled();
+ 
+         set_enabled(false);
+-        let (node, early) = seeded_node().await;
++        let (node, early) = seeded_node(scattered).await;
+         let off = run_all(&node, early).await;
+ 
+         set_enabled(true);
+         // A fresh node so the cache is built from scratch under the toggle.
+-        let (node_on, early_on) = seeded_node().await;
++        let (node_on, early_on) = seeded_node(scattered).await;
+         let on = run_all(&node_on, early_on).await;
+         // Same node, warm cache built at the latest basis, queried again including as-of.
+         let on_same_node = run_all(&node, early).await;
+@@ -553,24 +666,20 @@ mod tests {
+ 
+     #[tokio::test(flavor = "multi_thread")]
+     async fn zone_map_prunes_and_counts_skips() {
+-        let _guard = TOGGLE.lock().unwrap();
++        let _guard = TOGGLE.lock().unwrap_or_else(|error| error.into_inner());
+         let previous = enabled();
+         set_enabled(true);
+-        let (node, _) = seeded_node().await;
++        // Ages that track insertion order, so a run's value range is narrow.
++        let (node, _) = seeded_node(|index| index).await;
+         let db = node.db().await.expect("db");
++        let query = "[:find ?e ?n :where [?e :name ?n] [?e :age ?a] [(> ?a 550)]]";
+         // Warm the cache, then measure one execution.
+-        let _ = db
+-            .query("[:find ?e ?n :where [?e :name ?n] [?e :age ?a] [(> ?a 290)]]")
+-            .await
+-            .expect("query runs");
++        let _ = db.query(query).await.expect("query runs");
+         take_stats();
+-        let rows = db
+-            .query("[:find ?e ?n :where [?e :name ?n] [?e :age ?a] [(> ?a 290)]]")
+-            .await
+-            .expect("query runs");
++        let rows = db.query(query).await.expect("query runs");
+         let stats = take_stats();
+         set_enabled(previous);
+-        assert_eq!(rows.len(), 18, "ages 291..299 hit twice over 600 entities");
++        assert_eq!(rows.len(), 49, "ages 551..599");
+         assert!(
+             stats.seeks_checked > 0,
+             "zone map was never consulted: {stats:?}"
+-- 
+2.51.2
+

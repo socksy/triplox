@@ -1,0 +1,1874 @@
+From 9e6970647a45343c40c677adbd7b8581e3452af5 Mon Sep 17 00:00:00 2001
+From: Ben Lovell <ben.j.lovell@gmail.com>
+Date: Thu, 3 Sep 2026 19:39:14 +0200
+Subject: [PATCH 02/36] wip(columnar-storage): recover in-progress experiment
+ state and add PROGRESS.md
+
+---
+ PROGRESS.md                      |  34 ++
+ src/bootstrap.rs                 |  21 +-
+ src/db_value.rs                  |  14 +
+ src/indexer.rs                   | 104 ++++-
+ src/iterator/mod.rs              |   1 +
+ src/iterator/segment_iterator.rs | 500 +++++++++++++++++++++
+ src/lib.rs                       |   2 +
+ src/node.rs                      |  36 +-
+ src/query/patterns/triple.rs     |  50 ++-
+ src/segment.rs                   | 722 +++++++++++++++++++++++++++++++
+ src/tx.rs                        |  21 +-
+ 11 files changed, 1468 insertions(+), 37 deletions(-)
+ create mode 100644 PROGRESS.md
+ create mode 100644 src/iterator/segment_iterator.rs
+ create mode 100644 src/segment.rs
+
+diff --git a/PROGRESS.md b/PROGRESS.md
+new file mode 100644
+index 0000000..02b530a
+--- /dev/null
++++ b/PROGRESS.md
+@@ -0,0 +1,34 @@
++# Experiment: columnar (SoA) segment encoding for AEV/AVE
++
++## Goal
++Pack runs of sorted datoms for one attribute into one SlateDB key (keyed by the last datom key so forward seek lands on the right segment) with column-wise encoding: first/second component, op bitmap, tx column; FOR + bit-packing for integer columns, offsets+bytes otherwise. Column-only reads for AE/AV-style scans. Toggle: layout switch (see src/segment.rs and how bootstrap/node pass a layout). Ingest may be slow but must be correct. Temporal filtering must work via the tx column.
++
++## Status (as of hand-off)
++- Compiles (cargo check --all-targets clean).
++- New: src/segment.rs (format, encode/decode, segmentation rules in module doc), src/iterator/segment_iterator.rs (ScanMode Pair/First, temporal version resolution per logical key).
++- Modified: bootstrap.rs (init_db_with_layout), db_value.rs, indexer.rs (write path), iterator/mod.rs, lib.rs, node.rs, query/patterns/triple.rs, tx.rs (lookup_tx_completion takes a layout).
++- Previous agent was mid-way through applying the node.rs / tx.rs / bootstrap.rs plumbing edits with a script when it stopped. The tree compiles, but verify the layout toggle actually reaches the indexer and the iterators (grep for the layout type) and that the columnar path is exercised at all, not just the row path.
++
++## Next
++1. Confirm the toggle plumbs end to end; run the bench once with columnar on and check row counts against baseline.
++2. Equivalence test across layouts on a small graph (include an as-of query).
++3. cargo test -p triplox, clippy.
++4. A/B bench; report SlateDB key count and bytes per index before/after and ingest_ms.
++5. EXPERIMENT.md, fmt, commit.
++
++## Shared context
++
++Toolchain: every shell needs `export PATH="$HOME/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin:$PATH"` and `export CARGO_BUILD_JOBS=3`. Never run `cargo clean`. Work only in this worktree.
++
++Benchmark: `cargo bench --bench datalog_bench` (env VERTICES, EDGE_PROB, RUNS, BENCH_OUT). Baseline JSON: /private/tmp/claude-501/-Users-ben-code-triplox/2cc95019-6318-4527-8430-7ad4b12972b9/scratchpad/results/baseline.json. Baseline medians (ms): triangles 537 (7821 rows), two_hop_count 223, three_hop_count 7041, out_degree 44 (2000 rows), in_degree_top 44 (2000 rows), neighbors_of_42 1.1 (21 rows), weight_filter 3.7 (198 rows), weight_sum 3.6, heavy_neighbors 68 (1908 rows), label_lookup 0.02 (1 row).
++
++Definition of done:
++1. Feature behind an env toggle; results identical on/off (row counts match baseline; an on/off equivalence test on a small graph).
++2. `cargo test -p triplox` and `cargo clippy -p triplox --all-targets` pass, or failures are listed here honestly.
++3. A/B interleaved bench, 3 runs each; JSON written to /private/tmp/claude-501/-Users-ben-code-triplox/2cc95019-6318-4527-8430-7ad4b12972b9/scratchpad/results/columnar-storage-off.json and /private/tmp/claude-501/-Users-ben-code-triplox/2cc95019-6318-4527-8430-7ad4b12972b9/scratchpad/results/columnar-storage-on.json.
++4. EXPERIMENT.md at worktree root: what was built, hook points (file:line), A/B table, what failed, honest verdict and integration cost.
++5. `cargo fmt`; commit on this branch; do not push; no GitHub issues/PRs.
++
++## Progress protocol
++
++After every milestone (compiles, test passes, bench run, doc written): update the Status and Next sections below, then `git add -A && git commit -q -m "wip(columnar-storage): <milestone>"`. Commit even if incomplete. This file is the hand-off; a fresh agent must be able to continue from it alone.
+diff --git a/src/bootstrap.rs b/src/bootstrap.rs
+index 42134c0..12579f4 100644
+--- a/src/bootstrap.rs
++++ b/src/bootstrap.rs
+@@ -3,13 +3,14 @@ use std::sync::LazyLock;
+ 
+ use crate::clock::st_from_unix_epoch;
+ use crate::codec;
+-use crate::indexer::{build_tx_entity_datoms, write_index_entries};
++use crate::indexer::{build_tx_entity_datoms, write_index_entries_with_layout};
+ use crate::metadata::{Metadata, PartitionMap};
+ use crate::partition::{
+     extract_counter, partition_entity_prefix, COUNTER_BITS, DB_PARTITION, TX_PARTITION,
+     USER_PARTITION,
+ };
+ use crate::schema::{bootstrap_schema, bootstrap_schema_tx, load_schema_from_indices, Schema};
++use crate::segment::SegmentLayout;
+ use crate::slate::{SlateComponents, DEFAULT_SCAN_OPTIONS, DEFAULT_WRITE_OPTIONS};
+ use crate::tempids;
+ use crate::transaction::TxKey;
+@@ -82,6 +83,13 @@ pub(crate) async fn scan_partition_counters(slatedb: &Db) -> Result<PartitionMap
+ /// - **Existing DB**: loads the schema from indices via the Datalog query engine,
+ ///   derives counters by scanning the EAV index.
+ pub async fn init_db(slate: &SlateComponents) -> Result<Metadata> {
++    init_db_with_layout(slate, SegmentLayout::from_env()).await
++}
++
++pub async fn init_db_with_layout(
++    slate: &SlateComponents,
++    layout: SegmentLayout,
++) -> Result<Metadata> {
+     let version_key = concat_bytes(&[&[codec::META_INDEX], META_KEY_VERSION]);
+ 
+     match slate
+@@ -131,7 +139,16 @@ pub async fn init_db(slate: &SlateComponents) -> Result<Metadata> {
+             );
+ 
+             let mut batch = WriteBatch::new();
+-            write_index_entries(&mut batch, &datoms, &bootstrap_schema, BOOTSTRAP_TX_EID).unwrap();
++            write_index_entries_with_layout(
++                slate.db.as_ref(),
++                &mut batch,
++                &datoms,
++                &bootstrap_schema,
++                BOOTSTRAP_TX_EID,
++                layout,
++            )
++            .await
++            .unwrap();
+             // Write version
+             let version = env!("CARGO_PKG_VERSION");
+             batch.put(&version_key, version.as_bytes());
+diff --git a/src/db_value.rs b/src/db_value.rs
+index a9226b9..2710660 100644
+--- a/src/db_value.rs
++++ b/src/db_value.rs
+@@ -8,6 +8,7 @@ use crate::ops::QueryArg;
+ use crate::partition::tx_eid_from_tx_id;
+ use crate::query::{execute_query, QueryResult};
+ use crate::schema::IdentMap;
++use crate::segment::SegmentLayout;
+ use triplox_client::node::{Database, IntoQuery};
+ use triplox_client::transaction::TxKey;
+ 
+@@ -21,6 +22,7 @@ where
+     handle: Handle,
+     tx_key: TxKey,
+     range_stats: Arc<slatedb_estimates::RangeStats<M>>,
++    layout: SegmentLayout,
+ }
+ 
+ impl<D, M> Clone for DB<D, M>
+@@ -35,6 +37,7 @@ where
+             handle: self.handle.clone(),
+             tx_key: self.tx_key,
+             range_stats: Arc::clone(&self.range_stats),
++            layout: self.layout,
+         }
+     }
+ }
+@@ -58,9 +61,15 @@ where
+             handle,
+             tx_key,
+             range_stats,
++            layout: SegmentLayout::from_env(),
+         }
+     }
+ 
++    pub fn with_layout(mut self, layout: SegmentLayout) -> Self {
++        self.layout = layout;
++        self
++    }
++
+     /// Construct a DB from a SlateDB instance by scanning EAV for TX_PARTITION entities to find the latest TxKey.
+     pub async fn from_latest_sdb(
+         sdb: Arc<D>,
+@@ -75,6 +84,7 @@ where
+             handle,
+             tx_key,
+             range_stats,
++            layout: SegmentLayout::from_env(),
+         })
+     }
+ 
+@@ -82,6 +92,10 @@ where
+         self.tx_key
+     }
+ 
++    pub(crate) fn layout(&self) -> SegmentLayout {
++        self.layout
++    }
++
+     pub(crate) fn sdb(&self) -> &D {
+         self.sdb.as_ref()
+     }
+diff --git a/src/indexer.rs b/src/indexer.rs
+index d137de2..3c41504 100644
+--- a/src/indexer.rs
++++ b/src/indexer.rs
+@@ -20,6 +20,7 @@ use crate::ops::DataType;
+ use crate::ops::{Datom, DatomOp, Entid, TxOp};
+ use crate::partition::{extract_counter, partition_entity_prefix, tx_eid_from_tx_id, TX_PARTITION};
+ use crate::schema::{Schema, DB_TX_ABORTED, DB_TX_COMMITTED};
++use crate::segment::{merge_into_segments, SegmentLayout};
+ use crate::slate::{DEFAULT_SCAN_OPTIONS, DEFAULT_WRITE_OPTIONS};
+ use crate::tempids;
+ use crate::transaction::TxKey;
+@@ -47,14 +48,51 @@ pub struct Indexer {
+     metadata: Metadata,
+     latest_indexed_tx: TxKey,
+     tx_completion_sender: broadcast::Sender<TxCompletion>,
++    layout: SegmentLayout,
+ }
+ 
+-/// Write index entries for datoms into a SlateDB WriteBatch.
++/// Write index entries for datoms into a SlateDB WriteBatch (row layout).
+ pub(crate) fn write_index_entries(
+     batch: &mut WriteBatch,
+     datoms: &[Datom],
+     schema: &Schema,
+     tx_eid: i64,
++) -> Result<(), Error> {
++    write_index_entries_inner(batch, datoms, schema, tx_eid, None)
++}
++
++/// Write index entries in the given layout. Columnar merges AEV/AVE keys into
++/// segments (which needs reads) and skips AE/AV, which are served from segment columns.
++pub(crate) async fn write_index_entries_with_layout<D>(
++    db: &D,
++    batch: &mut WriteBatch,
++    datoms: &[Datom],
++    schema: &Schema,
++    tx_eid: i64,
++    layout: SegmentLayout,
++) -> Result<(), Error>
++where
++    D: DbReadOps + Sync,
++{
++    match layout {
++        SegmentLayout::Row => write_index_entries(batch, datoms, schema, tx_eid),
++        SegmentLayout::Columnar { segment_size } => {
++            let mut segmented = (Vec::new(), Vec::new());
++            write_index_entries_inner(batch, datoms, schema, tx_eid, Some(&mut segmented))?;
++            let (aev, ave) = segmented;
++            merge_into_segments(db, batch, codec::AEV, aev, segment_size).await?;
++            merge_into_segments(db, batch, codec::AVE, ave, segment_size).await
++        }
++    }
++}
++
++/// `segmented`, when given, collects the (AEV, AVE) row keys instead of putting them.
++fn write_index_entries_inner(
++    batch: &mut WriteBatch,
++    datoms: &[Datom],
++    schema: &Schema,
++    tx_eid: i64,
++    mut segmented: Option<&mut (Vec<Bytes>, Vec<Bytes>)>,
+ ) -> Result<(), Error> {
+     let tx_eid_bytes = encode_i64_bytes(tx_eid);
+     let mut key_buf: Vec<u8> = Vec::with_capacity(64);
+@@ -100,7 +138,10 @@ pub(crate) fn write_index_entries(
+         key_buf.extend_from_slice(entity_bytes);
+         key_buf.extend_from_slice(&tx_eid_bytes);
+         key_buf.push(op_byte);
+-        batch.put(&key_buf, b"");
++        match segmented.as_deref_mut() {
++            Some((_, ave)) => ave.push(Bytes::copy_from_slice(&key_buf)),
++            None => batch.put(&key_buf, b""),
++        }
+ 
+         // AEV
+         key_buf.clear();
+@@ -110,7 +151,10 @@ pub(crate) fn write_index_entries(
+         key_buf.extend_from_slice(value);
+         key_buf.extend_from_slice(&tx_eid_bytes);
+         key_buf.push(op_byte);
+-        batch.put(&key_buf, b"");
++        match segmented.as_deref_mut() {
++            Some((aev, _)) => aev.push(Bytes::copy_from_slice(&key_buf)),
++            None => batch.put(&key_buf, b""),
++        }
+ 
+         // VAE is a unique-only index used for uniqueness checks, lookup refs,
+         // and :db.unique/identity upsert resolution.
+@@ -127,7 +171,7 @@ pub(crate) fn write_index_entries(
+ 
+         // AE and AV are atemporal, purely additive indices.
+         // Retractions are not written to AE/AV.
+-        if datom.op == DatomOp::Assert {
++        if datom.op == DatomOp::Assert && segmented.is_none() {
+             key_buf.clear();
+             key_buf.push(codec::AE);
+             key_buf.extend_from_slice(&attr_bytes);
+@@ -252,9 +296,15 @@ impl Indexer {
+             metadata,
+             latest_indexed_tx,
+             tx_completion_sender,
++            layout: SegmentLayout::from_env(),
+         }
+     }
+ 
++    pub fn with_layout(mut self, layout: SegmentLayout) -> Self {
++        self.layout = layout;
++        self
++    }
++
+     pub fn metadata(&self) -> &Metadata {
+         &self.metadata
+     }
+@@ -352,7 +402,15 @@ impl Indexer {
+ 
+         // 9. Write indices + commit
+         let mut batch = WriteBatch::new();
+-        write_index_entries(&mut batch, &datoms, &self.metadata.schema, tx_eid)?;
++        write_index_entries_with_layout(
++            self.slatedb.as_ref(),
++            &mut batch,
++            &datoms,
++            &self.metadata.schema,
++            tx_eid,
++            self.layout,
++        )
++        .await?;
+         self.slatedb
+             .write_with_options(batch, &DEFAULT_WRITE_OPTIONS)
+             .await?;
+@@ -551,6 +609,7 @@ impl Indexer {
+             baseline: self.latest_indexed_tx,
+             rx: self.tx_completion_sender.subscribe(),
+             slatedb: self.slatedb.clone(),
++            layout: self.layout,
+         }
+     }
+ 
+@@ -561,7 +620,15 @@ impl Indexer {
+         pending_pm.set_tx_counter(tx_key.tx_id)?;
+         let datoms = build_tx_entity_datoms(tx_eid, tx_key, false, Some(error));
+         let mut batch = WriteBatch::new();
+-        write_index_entries(&mut batch, &datoms, &self.metadata.schema, tx_eid)?;
++        write_index_entries_with_layout(
++            self.slatedb.as_ref(),
++            &mut batch,
++            &datoms,
++            &self.metadata.schema,
++            tx_eid,
++            self.layout,
++        )
++        .await?;
+         self.slatedb
+             .write_with_options(batch, &DEFAULT_WRITE_OPTIONS)
+             .await?;
+@@ -581,6 +648,7 @@ pub(crate) struct TxWaiter {
+     baseline: TxKey,
+     rx: broadcast::Receiver<TxCompletion>,
+     slatedb: Arc<Db>,
++    layout: SegmentLayout,
+ }
+ 
+ impl TxWaiter {
+@@ -651,7 +719,7 @@ impl TxWaiter {
+     /// Recover an already-indexed transaction's outcome from storage.
+     /// A missing tx entity means a technical failure.
+     async fn completion_from_storage(&self, tx_key: TxKey) -> Result<TxCompletion, Error> {
+-        match tx::lookup_tx_completion(self.slatedb.as_ref(), tx_key).await? {
++        match tx::lookup_tx_completion(self.slatedb.as_ref(), tx_key, self.layout).await? {
+             Some(completion) => Ok(completion),
+             // TODO: Deal with proper error escalation here. See #118.
+             None => {
+@@ -1217,9 +1285,10 @@ mod tests {
+             )
+             .await?;
+ 
+-        let completion = tx::lookup_tx_completion(components.db.as_ref(), tx_key)
+-            .await?
+-            .expect("tx entity should exist");
++        let completion =
++            tx::lookup_tx_completion(components.db.as_ref(), tx_key, SegmentLayout::Row)
++                .await?
++                .expect("tx entity should exist");
+         assert_eq!(completion.tx_key, basis);
+         assert!(matches!(completion.outcome, TxOutcome::Committed));
+ 
+@@ -1245,9 +1314,10 @@ mod tests {
+             )
+             .await?;
+ 
+-        let completion = tx::lookup_tx_completion(components.db.as_ref(), tx_key)
+-            .await?
+-            .expect("aborted tx entity should exist");
++        let completion =
++            tx::lookup_tx_completion(components.db.as_ref(), tx_key, SegmentLayout::Row)
++                .await?
++                .expect("aborted tx entity should exist");
+         assert_eq!(completion.tx_key, basis);
+         assert!(matches!(completion.outcome, TxOutcome::Aborted(_)));
+         assert_outcome_err(&completion.outcome, "Unknown attribute");
+@@ -1263,9 +1333,11 @@ mod tests {
+             tx_id: 42,
+             system_time: st_from_unix_epoch(2),
+         };
+-        assert!(tx::lookup_tx_completion(components.db.as_ref(), tx_key)
+-            .await?
+-            .is_none());
++        assert!(
++            tx::lookup_tx_completion(components.db.as_ref(), tx_key, SegmentLayout::Row)
++                .await?
++                .is_none()
++        );
+ 
+         Ok(())
+     }
+diff --git a/src/iterator/mod.rs b/src/iterator/mod.rs
+index d0dd4ec..3a04a0c 100644
+--- a/src/iterator/mod.rs
++++ b/src/iterator/mod.rs
+@@ -1,3 +1,4 @@
++pub(crate) mod segment_iterator;
+ pub(crate) mod slate_iterator;
+ pub(crate) mod slate_key_iterator;
+ pub(crate) mod temporal_filter_iterator;
+diff --git a/src/iterator/segment_iterator.rs b/src/iterator/segment_iterator.rs
+new file mode 100644
+index 0000000..9779169
+--- /dev/null
++++ b/src/iterator/segment_iterator.rs
+@@ -0,0 +1,500 @@
++use std::cmp::Ordering;
++use std::sync::Arc;
++
++use anyhow::{bail, Error};
++use bytes::Bytes;
++use slatedb::{DbMetadataOps, DbReadOps};
++use tokio::runtime::Handle;
++
++use crate::codec;
++use crate::index::IndexType;
++use crate::segment::{attr_range_end, Segment, ATTR_PREFIX_LEN};
++use crate::slate::DEFAULT_SCAN_OPTIONS;
++
++use super::slate_iterator::{Extractor, Index};
++
++/// Which columns a scan needs.
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum ScanMode {
++    /// AEV/AVE: decode every column, resolve temporal versions per logical key.
++    Pair,
++    /// AE/AV: decode the first column and the op bitmap only, emit each
++    /// distinct first component that has at least one assertion.
++    First,
++}
++
++/// Iterates datoms stored in columnar segments and presents them with the same
++/// key shapes the row layout produces, so extractors and callers stay unchanged.
++///
++/// AE/AV scans are served from the first column of AEV/AVE segments.
++pub(crate) struct SegmentIterator<M>
++where
++    M: DbMetadataOps + Send + Sync,
++{
++    inner: slatedb::DbIterator,
++    handle: Handle,
++    extractor: Extractor,
++    range_stats: Arc<slatedb_estimates::RangeStats<M>>,
++    segment_size: usize,
++    mode: ScanMode,
++    caller_index: u8,
++    caller_prefix: Bytes,
++    attr_prefix: Vec<u8>,
++    rest_prefix: Vec<u8>,
++    as_of: i64,
++    segment: Option<(Bytes, Segment)>,
++    pos: usize,
++    current: Option<Bytes>,
++    last_group: Option<Vec<u8>>,
++    group_emitted: bool,
++    done: bool,
++}
++
++impl<M> SegmentIterator<M>
++where
++    M: DbMetadataOps + Send + Sync,
++{
++    #[allow(clippy::too_many_arguments)]
++    pub fn new<D>(
++        index_type: IndexType,
++        prefix: &[u8],
++        slate: &D,
++        handle: Handle,
++        extractor: Extractor,
++        as_of: i64,
++        range_stats: Arc<slatedb_estimates::RangeStats<M>>,
++        segment_size: usize,
++    ) -> Result<Self, Error>
++    where
++        D: DbReadOps + Send + Sync,
++    {
++        if prefix.len() < ATTR_PREFIX_LEN {
++            bail!("segment scans need at least an attribute prefix");
++        }
++        let (storage_index, mode) = match index_type {
++            IndexType::AEV => (codec::AEV, ScanMode::Pair),
++            IndexType::AVE => (codec::AVE, ScanMode::Pair),
++            IndexType::AE => (codec::AEV, ScanMode::First),
++            IndexType::AV => (codec::AVE, ScanMode::First),
++            other => bail!("{other:?} is not stored in segments"),
++        };
++        let mut attr_prefix = vec![storage_index];
++        attr_prefix.extend_from_slice(&prefix[1..ATTR_PREFIX_LEN]);
++        let rest_prefix = prefix[ATTR_PREFIX_LEN..].to_vec();
++        let mut start = attr_prefix.clone();
++        start.extend_from_slice(&rest_prefix);
++        let inner = match attr_range_end(&attr_prefix) {
++            Some(end) => {
++                handle.block_on(slate.scan_with_options(start..end, &DEFAULT_SCAN_OPTIONS))?
++            }
++            None => handle.block_on(slate.scan_with_options(start.., &DEFAULT_SCAN_OPTIONS))?,
++        };
++        let mut iter = Self {
++            inner,
++            handle,
++            extractor,
++            range_stats,
++            segment_size,
++            mode,
++            caller_index: prefix[0],
++            caller_prefix: Bytes::copy_from_slice(prefix),
++            attr_prefix,
++            rest_prefix,
++            as_of,
++            segment: None,
++            pos: 0,
++            current: None,
++            last_group: None,
++            group_emitted: false,
++            done: false,
++        };
++        if iter.load_next_segment()? {
++            let rest = iter.rest_prefix.clone();
++            iter.pos = iter.segment.as_ref().unwrap().1.lower_bound(&rest);
++        }
++        iter.advance_to_next_valid()?;
++        Ok(iter)
++    }
++
++    fn load_next_segment(&mut self) -> Result<bool, Error> {
++        self.segment = None;
++        self.pos = 0;
++        let Some(kv) = self.handle.block_on(self.inner.next())? else {
++            return Ok(false);
++        };
++        if !kv.key.starts_with(&self.attr_prefix) {
++            return Ok(false);
++        }
++        let segment = match self.mode {
++            ScanMode::Pair => Segment::decode(&kv.value)?,
++            ScanMode::First => Segment::decode_first_column(&kv.value)?,
++        };
++        self.segment = Some((kv.key, segment));
++        Ok(true)
++    }
++
++    /// Bytes identifying datom `i`'s group: the logical key (Pair) or first component (First).
++    fn group_bytes(&self, segment: &Segment, i: usize) -> Vec<u8> {
++        let mut s1 = [0u8; 9];
++        let mut s2 = [0u8; 9];
++        let mut out = segment.first.get(i, &mut s1).to_vec();
++        if self.mode == ScanMode::Pair {
++            out.extend_from_slice(segment.second.get(i, &mut s2));
++        }
++        out
++    }
++
++    fn same_group(&self, segment: &Segment, i: usize) -> bool {
++        let Some(last) = &self.last_group else {
++            return false;
++        };
++        let mut s1 = [0u8; 9];
++        let mut s2 = [0u8; 9];
++        let first = segment.first.get(i, &mut s1);
++        match self.mode {
++            ScanMode::First => first == last.as_slice(),
++            ScanMode::Pair => {
++                if !last.starts_with(first) {
++                    return false;
++                }
++                segment.second.get(i, &mut s2) == &last[first.len()..]
++            }
++        }
++    }
++
++    fn caller_key(&self, segment: &Segment, i: usize) -> Bytes {
++        match self.mode {
++            ScanMode::Pair => Bytes::from(segment.row_key(&self.attr_prefix, i)),
++            ScanMode::First => {
++                let mut s1 = [0u8; 9];
++                let mut key = Vec::with_capacity(ATTR_PREFIX_LEN + 9);
++                key.push(self.caller_index);
++                key.extend_from_slice(&self.attr_prefix[1..]);
++                key.extend_from_slice(segment.first.get(i, &mut s1));
++                Bytes::from(key)
++            }
++        }
++    }
++
++    fn advance_to_next_valid(&mut self) -> Result<(), Error> {
++        loop {
++            if self.done {
++                self.current = None;
++                return Ok(());
++            }
++            if self.segment.is_none() && !self.load_next_segment()? {
++                self.done = true;
++                continue;
++            }
++            let (_, segment) = self.segment.as_ref().unwrap();
++            if self.pos >= segment.len() {
++                self.segment = None;
++                continue;
++            }
++            let i = self.pos;
++            self.pos += 1;
++            if !segment.key_starts_with(i, &self.rest_prefix) {
++                self.done = true;
++                continue;
++            }
++            match self.mode {
++                ScanMode::Pair => {
++                    if self.same_group(segment, i) || segment.txs[i] > self.as_of {
++                        continue;
++                    }
++                    let group = self.group_bytes(segment, i);
++                    self.last_group = Some(group);
++                    if segment.is_retract(i) {
++                        continue;
++                    }
++                }
++                ScanMode::First => {
++                    if self.same_group(segment, i) {
++                        if self.group_emitted || segment.is_retract(i) {
++                            continue;
++                        }
++                    } else {
++                        let group = self.group_bytes(segment, i);
++                        self.last_group = Some(group);
++                        self.group_emitted = false;
++                        if segment.is_retract(i) {
++                            continue;
++                        }
++                    }
++                    self.group_emitted = true;
++                }
++            }
++            let (_, segment) = self.segment.as_ref().unwrap();
++            self.current = Some(self.caller_key(segment, i));
++            return Ok(());
++        }
++    }
++
++    fn current_logical(&self) -> Option<&[u8]> {
++        let current = self.current.as_ref()?;
++        Some(match self.mode {
++            ScanMode::Pair => &current[..current.len() - codec::TX_EID_OP_SUFFIX],
++            ScanMode::First => current.as_ref(),
++        })
++    }
++}
++
++impl<M> Index for SegmentIterator<M>
++where
++    M: DbMetadataOps + Send + Sync,
++{
++    fn count(&self) -> Result<u64, Error> {
++        let mut prefix = self.attr_prefix.clone();
++        prefix.extend_from_slice(&self.rest_prefix);
++        let segments = self
++            .handle
++            .block_on(self.range_stats.estimate_key_count_with_prefix(&prefix))?;
++        Ok(segments.saturating_mul(self.segment_size as u64))
++    }
++
++    fn seek(&mut self, extension: Bytes) -> Result<(), Error> {
++        let mut target = self.caller_prefix.to_vec();
++        target.extend_from_slice(&extension);
++        if let Some(current) = self.current_logical() {
++            if current >= target.as_slice() {
++                return Ok(());
++            }
++        }
++        if self.done {
++            return Ok(());
++        }
++        target[0] = self.attr_prefix[0];
++        let rest_target = target[ATTR_PREFIX_LEN..].to_vec();
++
++        let in_segment = match &self.segment {
++            Some((seg_key, _)) => seg_key.as_ref().cmp(target.as_slice()) != Ordering::Less,
++            None => false,
++        };
++        if !in_segment {
++            self.handle.block_on(self.inner.seek(&target))?;
++            if !self.load_next_segment()? {
++                self.done = true;
++                self.current = None;
++                return Ok(());
++            }
++        }
++        let (_, segment) = self.segment.as_ref().unwrap();
++        self.pos = segment.lower_bound(&rest_target).max(self.pos);
++        self.last_group = None;
++        self.group_emitted = false;
++        self.advance_to_next_valid()
++    }
++
++    fn next(&mut self) -> Result<Option<Bytes>, Error> {
++        self.advance_to_next_valid()?;
++        self.get_value()
++    }
++
++    fn get_value(&self) -> Result<Option<Bytes>, Error> {
++        Ok(self.current.clone().map(|key| (self.extractor)(key)))
++    }
++
++    fn has_next(&self) -> bool {
++        self.current.is_some()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::codec::Encode;
++    use crate::ops::DataType;
++    use crate::segment::merge_into_segments;
++    use crate::slate::in_memory_slate;
++    use crate::util::make_extractor;
++    use slatedb::WriteBatch;
++
++    fn row_key(index: u8, attr: i64, e: i64, v: &DataType, tx: i64, op: u8) -> Bytes {
++        let mut key = vec![index];
++        key.extend_from_slice(&codec::encode_i64_bytes(attr));
++        let e = DataType::Long(e).encode();
++        let v = v.encode();
++        if index == codec::AEV {
++            key.extend_from_slice(&e);
++            key.extend_from_slice(&v);
++        } else {
++            key.extend_from_slice(&v);
++            key.extend_from_slice(&e);
++        }
++        key.extend_from_slice(&codec::encode_i64_bytes(tx));
++        key.push(op);
++        Bytes::from(key)
++    }
++
++    fn attr_prefix(index: u8, attr: i64) -> Vec<u8> {
++        let mut p = vec![index];
++        p.extend_from_slice(&codec::encode_i64_bytes(attr));
++        p
++    }
++
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn pair_scan_resolves_versions_across_segments() {
++        let components = in_memory_slate().await;
++        let db = components.db.clone();
++        // 40 entities, 3 values each, entity 5 retracted at tx 20, entity 7 re-added later.
++        let mut keys = Vec::new();
++        for e in 0..40 {
++            for v in 0..3 {
++                keys.push(row_key(
++                    codec::AEV,
++                    9,
++                    e,
++                    &DataType::Long(v),
++                    10,
++                    codec::ADD,
++                ));
++            }
++        }
++        keys.push(row_key(
++            codec::AEV,
++            9,
++            5,
++            &DataType::Long(1),
++            20,
++            codec::RETRACT,
++        ));
++        keys.push(row_key(
++            codec::AEV,
++            9,
++            7,
++            &DataType::Long(1),
++            20,
++            codec::RETRACT,
++        ));
++        keys.push(row_key(
++            codec::AEV,
++            9,
++            7,
++            &DataType::Long(1),
++            30,
++            codec::ADD,
++        ));
++        let mut batch = WriteBatch::new();
++        merge_into_segments(db.as_ref(), &mut batch, codec::AEV, keys, 16)
++            .await
++            .unwrap();
++        db.write(batch).await.unwrap();
++
++        let range_stats = components.range_stats.clone();
++        let handle = Handle::current();
++        tokio::task::spawn_blocking(move || {
++            let prefix = attr_prefix(codec::AEV, 9);
++            let prefix_len = prefix.len();
++            let collect = |as_of: i64| {
++                let mut iter = SegmentIterator::new(
++                    IndexType::AEV,
++                    &prefix,
++                    db.as_ref(),
++                    handle.clone(),
++                    Box::new(move |key: Bytes| {
++                        key.slice(prefix_len..key.len() - codec::TX_EID_OP_SUFFIX)
++                    }),
++                    as_of,
++                    range_stats.clone(),
++                    16,
++                )
++                .unwrap();
++                let mut out = Vec::new();
++                while let Some(v) = iter.get_value().unwrap() {
++                    out.push(v);
++                    iter.next().unwrap();
++                }
++                out
++            };
++            assert_eq!(collect(5).len(), 0);
++            assert_eq!(collect(10).len(), 120);
++            assert_eq!(collect(20).len(), 118);
++            assert_eq!(collect(30).len(), 119);
++
++            // Seek to entity 7 as of 30 and read its group.
++            let mut iter = SegmentIterator::new(
++                IndexType::AEV,
++                &prefix,
++                db.as_ref(),
++                handle.clone(),
++                Box::new(move |key: Bytes| {
++                    key.slice(prefix_len..key.len() - codec::TX_EID_OP_SUFFIX)
++                }),
++                30,
++                range_stats.clone(),
++                16,
++            )
++            .unwrap();
++            let e7 = Bytes::from(DataType::Long(7).encode());
++            iter.seek(e7.clone()).unwrap();
++            let mut group = Vec::new();
++            while let Some(v) = iter.get_value().unwrap() {
++                if !v.starts_with(&e7) {
++                    break;
++                }
++                group.push(v.slice(e7.len()..));
++                iter.next().unwrap();
++            }
++            let expected: Vec<Bytes> = [2i64, 1, 0]
++                .iter()
++                .map(|v| Bytes::from(DataType::Long(*v).encode()))
++                .collect();
++            assert_eq!(group, expected);
++        })
++        .await
++        .unwrap();
++    }
++
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn first_column_scan_matches_ae_semantics() {
++        let components = in_memory_slate().await;
++        let db = components.db.clone();
++        let mut keys = Vec::new();
++        for e in 0..30 {
++            keys.push(row_key(codec::AEV, 3, e, &DataType::Long(e), 1, codec::ADD));
++        }
++        // Entity 100 only ever retracted: AE would not list it.
++        keys.push(row_key(
++            codec::AEV,
++            3,
++            100,
++            &DataType::Long(1),
++            1,
++            codec::RETRACT,
++        ));
++        let mut batch = WriteBatch::new();
++        merge_into_segments(db.as_ref(), &mut batch, codec::AEV, keys, 8)
++            .await
++            .unwrap();
++        db.write(batch).await.unwrap();
++
++        let range_stats = components.range_stats.clone();
++        let handle = Handle::current();
++        tokio::task::spawn_blocking(move || {
++            let prefix = attr_prefix(codec::AE, 3);
++            let mut iter = SegmentIterator::new(
++                IndexType::AE,
++                &prefix,
++                db.as_ref(),
++                handle,
++                Box::new(|key| make_extractor(1, IndexType::AE)(key)),
++                i64::MAX,
++                range_stats,
++                8,
++            )
++            .unwrap();
++            let mut seen = Vec::new();
++            while let Some(v) = iter.get_value().unwrap() {
++                seen.push(v);
++                iter.next().unwrap();
++            }
++            let mut expected: Vec<Bytes> = (0..30)
++                .map(|e| Bytes::from(DataType::Long(e).encode()))
++                .collect();
++            expected.sort();
++            assert_eq!(seen, expected);
++        })
++        .await
++        .unwrap();
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index b01c640..e2bea0f 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -27,6 +27,7 @@ mod query_validation;
+ pub mod schema;
+ #[cfg(not(any(test, feature = "test-helpers")))]
+ mod schema;
++mod segment;
+ mod slate;
+ mod tempids;
+ pub mod tx;
+@@ -39,4 +40,5 @@ pub mod node;
+ pub mod server;
+ 
+ pub use node::{Database, IntoQuery, Node, QueryNode, SubmitNode, TransactionResult, TxKey, DB};
++pub use segment::SegmentLayout;
+ pub use triplox_client::{client, msgpack_codec, protocol, subscription, transaction};
+diff --git a/src/node.rs b/src/node.rs
+index 1e3225c..17d3013 100644
+--- a/src/node.rs
++++ b/src/node.rs
+@@ -22,6 +22,7 @@ use crate::log::{subscribe, TxLog, TxLogReader, TxLogWriter};
+ use crate::memory_log::MemoryLog;
+ use crate::ops::{QueryArg, TxOp};
+ use crate::schema::Schema;
++use crate::segment::SegmentLayout;
+ use crate::slate::{in_memory_slate, local_slate, remote_slate, SlateComponents};
+ use edn::query::ParsedQuery;
+ use tokio_util::sync::CancellationToken;
+@@ -40,6 +41,7 @@ pub struct Node<L: TxLog> {
+     pub(crate) slate: SlateComponents,
+     subscription: CancellationToken,
+     incremental: IncrementalQueryService,
++    layout: SegmentLayout,
+ }
+ 
+ pub(crate) trait SchemaProvider: Send + Sync + 'static {
+@@ -107,21 +109,31 @@ impl<L: TxLog> Node<L> {
+             slate,
+             subscription,
+             incremental,
++            layout: SegmentLayout::from_env(),
+         })
+     }
+ }
+ 
+ impl Node<MemoryLog> {
+     pub async fn memory_node() -> Self {
++        Self::memory_node_with_layout(SegmentLayout::from_env()).await
++    }
++
++    pub async fn memory_node_with_layout(layout: SegmentLayout) -> Self {
+         let slate = in_memory_slate().await;
+-        let metadata = crate::bootstrap::init_db(&slate).await.unwrap();
++        let metadata = crate::bootstrap::init_db_with_layout(&slate, layout)
++            .await
++            .unwrap();
+         let bootstrap_tx_key = *crate::bootstrap::BOOTSTRAP_TX_KEY;
+-        let indexer = Arc::new(tokio::sync::RwLock::new(Indexer::new(
+-            slate.db.clone(),
+-            metadata,
+-            bootstrap_tx_key,
+-            DEFAULT_TX_COMPLETION_CAPACITY,
+-        )));
++        let indexer = Arc::new(tokio::sync::RwLock::new(
++            Indexer::new(
++                slate.db.clone(),
++                metadata,
++                bootstrap_tx_key,
++                DEFAULT_TX_COMPLETION_CAPACITY,
++            )
++            .with_layout(layout),
++        ));
+         let log = Arc::new(MemoryLog::new(Box::new(clock::SystemClock)));
+         log.ensure_bootstrap_record().await.unwrap();
+ 
+@@ -144,6 +156,7 @@ impl Node<MemoryLog> {
+             slate,
+             subscription,
+             incremental,
++            layout,
+         }
+     }
+ }
+@@ -261,7 +274,8 @@ impl<L: TxLog> Node<L> {
+             handle,
+             tx_key,
+             range_stats,
+-        ))
++        )
++        .with_layout(self.layout))
+     }
+ 
+     pub(crate) async fn register_incremental_query(
+@@ -331,7 +345,11 @@ impl<L: TxLog> QueryNode for Node<L> {
+             .clone();
+         let handle = Handle::current();
+         let range_stats = self.slate.range_stats.clone();
+-        DB::from_latest_sdb(self.slate.db.clone(), ident_map, handle, range_stats).await
++        Ok(
++            DB::from_latest_sdb(self.slate.db.clone(), ident_map, handle, range_stats)
++                .await?
++                .with_layout(self.layout),
++        )
+     }
+ 
+     async fn db_as_of(&self, tx_key: TxKey) -> Result<DB, Error> {
+diff --git a/src/query/patterns/triple.rs b/src/query/patterns/triple.rs
+index fd0ac0d..8984703 100644
+--- a/src/query/patterns/triple.rs
++++ b/src/query/patterns/triple.rs
+@@ -9,10 +9,12 @@ use slatedb::{DbMetadataOps, DbReadOps};
+ use crate::codec;
+ use crate::db_value::DB;
+ use crate::index::IndexType;
++use crate::iterator::segment_iterator::SegmentIterator;
+ use crate::iterator::slate_iterator::{Extractor, Index, SlateIterator};
+ use crate::iterator::temporal_filter_iterator::TemporalFilterIterator;
+ use crate::query::binding_bag::{BindingBag, BindingRow};
+ use crate::query::exec_pattern::{ExecPattern, PatternId, Proposal};
++use crate::segment::SegmentLayout;
+ use crate::util::make_extractor;
+ 
+ #[derive(Clone, Debug, Eq, PartialEq)]
+@@ -109,11 +111,32 @@ where
+     }
+ 
+     fn estimate_count(&self, prefix: &[u8]) -> Result<usize> {
+-        let count = self
+-            .db
+-            .handle()
+-            .block_on(self.db.range_stats().estimate_key_count_with_prefix(prefix))?;
+-        Ok(usize::try_from(count)?)
++        let layout = self.db.layout();
++        // Segments are keyed once per `segment_size` datoms; AE/AV live in AEV/AVE segments.
++        let (prefix, scale) = match (layout, prefix[0]) {
++            (SegmentLayout::Columnar { segment_size }, codec::AE) => {
++                let mut p = prefix.to_vec();
++                p[0] = codec::AEV;
++                (p, segment_size)
++            }
++            (SegmentLayout::Columnar { segment_size }, codec::AV) => {
++                let mut p = prefix.to_vec();
++                p[0] = codec::AVE;
++                (p, segment_size)
++            }
++            (SegmentLayout::Columnar { segment_size }, index)
++                if crate::segment::is_segmented_index(index) =>
++            {
++                (prefix.to_vec(), segment_size)
++            }
++            _ => (prefix.to_vec(), 1),
++        };
++        let count = self.db.handle().block_on(
++            self.db
++                .range_stats()
++                .estimate_key_count_with_prefix(&prefix),
++        )?;
++        Ok(usize::try_from(count)?.saturating_mul(scale))
+     }
+ 
+     fn create_iterator(
+@@ -122,6 +145,23 @@ where
+         index_type: IndexType,
+         extractor: Extractor,
+     ) -> Result<Box<dyn Index>> {
++        if let SegmentLayout::Columnar { segment_size } = self.db.layout() {
++            if matches!(
++                index_type,
++                IndexType::AE | IndexType::AV | IndexType::AEV | IndexType::AVE
++            ) {
++                return Ok(Box::new(SegmentIterator::new(
++                    index_type,
++                    &prefix,
++                    self.db.sdb(),
++                    self.db.handle().clone(),
++                    extractor,
++                    self.db.as_of(),
++                    Arc::clone(self.db.range_stats()),
++                    segment_size,
++                )?));
++            }
++        }
+         match index_type {
+             IndexType::AE | IndexType::AV => Ok(Box::new(SlateIterator::new(
+                 &prefix,
+diff --git a/src/segment.rs b/src/segment.rs
+new file mode 100644
+index 0000000..b8f656e
+--- /dev/null
++++ b/src/segment.rs
+@@ -0,0 +1,722 @@
++//! Columnar segment storage for the AEV and AVE indexes.
++//!
++//! In the row layout every datom is its own SlateDB key. In the columnar layout
++//! runs of sorted datoms for one attribute are packed into a segment stored under
++//! one key: the full row key of the segment's *last* datom. Keying by the last
++//! datom means a forward `seek(target)` lands on the segment that contains
++//! `target`, which is all a forward-only LSM iterator can give us.
++//!
++//! Segment value layout (all integers little-endian):
++//!
++//! ```text
++//! u8 version | u8 index byte | u32 n
++//! column first   (E for AEV, V for AVE)
++//! column second  (V for AEV, E for AVE)
++//! column ops     (bitmap, 1 = retract)
++//! column tx      (i64 tx_eid)
++//! ```
++//!
++//! Every column is `u32 byte_len` + payload so a reader can skip the ones it
++//! does not need. Integer columns are frame-of-reference + bit-packed. A value
++//! column whose entries are all `DataType::Long` is stored as an integer
++//! column, otherwise as an offset array + concatenated encoded bytes.
++//!
++//! Segmentation is deliberately simple: segments never cross an attribute
++//! boundary, a write merges new datoms into the segment whose key range covers
++//! them and re-chunks the result into `segment_size` pieces, and datoms that
++//! sort after the last existing segment start a new segment. There is no
++//! background merge of small segments.
++
++use std::cmp::Ordering;
++use std::collections::BTreeMap;
++use std::sync::OnceLock;
++
++use anyhow::{bail, Result};
++use bytes::Bytes;
++use slatedb::{DbReadOps, WriteBatch};
++
++use crate::codec;
++use crate::protocol::TAG_LONG;
++use crate::slate::DEFAULT_SCAN_OPTIONS;
++use crate::util::next_prefix;
++
++pub const DEFAULT_SEGMENT_SIZE: usize = 1024;
++const SEGMENT_VERSION: u8 = 1;
++const COLUMN_LONGS: u8 = 0;
++const COLUMN_RAW: u8 = 1;
++
++/// Index byte + attribute id: the prefix every segment of one attribute shares.
++pub(crate) const ATTR_PREFIX_LEN: usize = codec::CODEC_LENGTH + codec::ATTRIBUTE_LENGTH;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum SegmentLayout {
++    Row,
++    Columnar { segment_size: usize },
++}
++
++impl SegmentLayout {
++    /// `TRIPLOX_SEGMENT_LAYOUT=columnar` selects segments, `TRIPLOX_SEGMENT_SIZE` sizes them.
++    pub fn from_env() -> Self {
++        static LAYOUT: OnceLock<SegmentLayout> = OnceLock::new();
++        *LAYOUT.get_or_init(|| {
++            let columnar = std::env::var("TRIPLOX_SEGMENT_LAYOUT")
++                .map(|v| v.eq_ignore_ascii_case("columnar"))
++                .unwrap_or(false);
++            if !columnar {
++                return SegmentLayout::Row;
++            }
++            let segment_size = std::env::var("TRIPLOX_SEGMENT_SIZE")
++                .ok()
++                .and_then(|v| v.parse().ok())
++                .filter(|n: &usize| *n > 0)
++                .unwrap_or(DEFAULT_SEGMENT_SIZE);
++            SegmentLayout::Columnar { segment_size }
++        })
++    }
++
++    pub fn is_columnar(&self) -> bool {
++        matches!(self, SegmentLayout::Columnar { .. })
++    }
++
++    pub fn segment_size(&self) -> usize {
++        match self {
++            SegmentLayout::Row => 1,
++            SegmentLayout::Columnar { segment_size } => *segment_size,
++        }
++    }
++}
++
++pub(crate) fn is_segmented_index(index: u8) -> bool {
++    index == codec::AEV || index == codec::AVE
++}
++
++// ---------------------------------------------------------------------------
++// Integer column: frame of reference + bit packing
++// ---------------------------------------------------------------------------
++
++fn encode_i64_column(vals: &[i64], out: &mut Vec<u8>) {
++    let min = vals.iter().copied().min().unwrap_or(0);
++    let max = vals.iter().copied().max().unwrap_or(0);
++    let range = (max as i128 - min as i128) as u128;
++    let width = (128 - range.leading_zeros()) as u8;
++    out.extend_from_slice(&min.to_le_bytes());
++    out.push(width);
++    let mut acc: u128 = 0;
++    let mut nbits: u32 = 0;
++    for &v in vals {
++        let d = (v as i128 - min as i128) as u64;
++        acc |= (d as u128) << nbits;
++        nbits += width as u32;
++        while nbits >= 8 {
++            out.push(acc as u8);
++            acc >>= 8;
++            nbits -= 8;
++        }
++    }
++    if nbits > 0 {
++        out.push(acc as u8);
++    }
++}
++
++fn decode_i64_column(mut buf: &[u8], n: usize) -> Result<Vec<i64>> {
++    if buf.len() < 9 {
++        bail!("segment integer column truncated");
++    }
++    let min = i64::from_le_bytes(buf[..8].try_into().unwrap());
++    let width = buf[8] as u32;
++    buf = &buf[9..];
++    let mut vals = Vec::with_capacity(n);
++    if width == 0 {
++        vals.resize(n, min);
++        return Ok(vals);
++    }
++    let mask: u128 = (1u128 << width) - 1;
++    let mut acc: u128 = 0;
++    let mut nbits: u32 = 0;
++    let mut pos = 0;
++    for _ in 0..n {
++        while nbits < width {
++            let Some(&b) = buf.get(pos) else {
++                bail!("segment integer column truncated");
++            };
++            acc |= (b as u128) << nbits;
++            nbits += 8;
++            pos += 1;
++        }
++        let d = (acc & mask) as u64;
++        acc >>= width;
++        nbits -= width;
++        vals.push((min as i128 + d as i128) as i64);
++    }
++    Ok(vals)
++}
++
++// ---------------------------------------------------------------------------
++// Generic column: all-Long integers or raw encoded bytes
++// ---------------------------------------------------------------------------
++
++#[derive(Debug, Clone, PartialEq)]
++pub(crate) enum Column {
++    Longs(Vec<i64>),
++    Raw { offsets: Vec<u32>, bytes: Vec<u8> },
++}
++
++impl Column {
++    /// Build from encoded `DataType` bytes (type tag included).
++    fn from_encoded(parts: &[&[u8]]) -> Self {
++        let all_long = parts
++            .iter()
++            .all(|p| p.len() == codec::ENTITY_LENGTH && p[0] == TAG_LONG);
++        if all_long {
++            let vals = parts
++                .iter()
++                .map(|p| i64::from_be_bytes(p[1..9].try_into().unwrap()) ^ i64::MAX)
++                .collect();
++            return Column::Longs(vals);
++        }
++        let mut offsets = Vec::with_capacity(parts.len() + 1);
++        let mut bytes = Vec::new();
++        offsets.push(0);
++        for p in parts {
++            bytes.extend_from_slice(p);
++            offsets.push(bytes.len() as u32);
++        }
++        Column::Raw { offsets, bytes }
++    }
++
++    fn encode(&self, out: &mut Vec<u8>) {
++        let start = out.len();
++        out.extend_from_slice(&0u32.to_le_bytes());
++        match self {
++            Column::Longs(vals) => {
++                out.push(COLUMN_LONGS);
++                encode_i64_column(vals, out);
++            }
++            Column::Raw { offsets, bytes } => {
++                out.push(COLUMN_RAW);
++                for o in offsets {
++                    out.extend_from_slice(&o.to_le_bytes());
++                }
++                out.extend_from_slice(bytes);
++            }
++        }
++        let len = (out.len() - start - 4) as u32;
++        out[start..start + 4].copy_from_slice(&len.to_le_bytes());
++    }
++
++    fn decode(buf: &[u8], n: usize) -> Result<Self> {
++        match buf.first() {
++            Some(&COLUMN_LONGS) => Ok(Column::Longs(decode_i64_column(&buf[1..], n)?)),
++            Some(&COLUMN_RAW) => {
++                let buf = &buf[1..];
++                let offsets_len = (n + 1) * 4;
++                if buf.len() < offsets_len {
++                    bail!("segment raw column truncated");
++                }
++                let offsets = buf[..offsets_len]
++                    .chunks_exact(4)
++                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
++                    .collect();
++                Ok(Column::Raw {
++                    offsets,
++                    bytes: buf[offsets_len..].to_vec(),
++                })
++            }
++            other => bail!("unknown segment column kind {other:?}"),
++        }
++    }
++
++    pub(crate) fn len(&self) -> usize {
++        match self {
++            Column::Longs(v) => v.len(),
++            Column::Raw { offsets, .. } => offsets.len() - 1,
++        }
++    }
++
++    /// Encoded bytes of entry `i`. Longs are re-encoded into `scratch`.
++    #[inline]
++    pub(crate) fn get<'a>(&'a self, i: usize, scratch: &'a mut [u8; 9]) -> &'a [u8] {
++        match self {
++            Column::Longs(v) => {
++                scratch[0] = TAG_LONG;
++                scratch[1..].copy_from_slice(&codec::encode_i64_bytes(v[i]));
++                scratch
++            }
++            Column::Raw { offsets, bytes } => &bytes[offsets[i] as usize..offsets[i + 1] as usize],
++        }
++    }
++
++    /// Byte-equality of entries `i` and `j`.
++    #[inline]
++    pub(crate) fn same(&self, i: usize, j: usize) -> bool {
++        match self {
++            Column::Longs(v) => v[i] == v[j],
++            Column::Raw { offsets, bytes } => {
++                bytes[offsets[i] as usize..offsets[i + 1] as usize]
++                    == bytes[offsets[j] as usize..offsets[j + 1] as usize]
++            }
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Segment
++// ---------------------------------------------------------------------------
++
++/// A decoded segment. `second` and `txs` are empty when only the first column was read.
++#[derive(Debug, Clone, PartialEq)]
++pub(crate) struct Segment {
++    pub index: u8,
++    pub first: Column,
++    pub second: Column,
++    pub ops: Vec<u8>,
++    pub txs: Vec<i64>,
++}
++
++fn split_row_key(index: u8, rest: &[u8]) -> Result<(&[u8], &[u8], i64, u8)> {
++    if rest.len() < codec::ENTITY_LENGTH + codec::TX_EID_OP_SUFFIX {
++        bail!("row key too short for segment");
++    }
++    let logical = &rest[..rest.len() - codec::TX_EID_OP_SUFFIX];
++    let mut t = &rest[rest.len() - codec::TX_EID_OP_SUFFIX..rest.len() - codec::OP_LENGTH];
++    let tx = codec::decode_i64(&mut t).map_err(|e| anyhow::anyhow!("{e}"))?;
++    let op = rest[rest.len() - 1];
++    let (first, second) = match index {
++        codec::AEV => logical.split_at(codec::ENTITY_LENGTH),
++        codec::AVE => logical.split_at(logical.len() - codec::ENTITY_LENGTH),
++        other => bail!("index {other} is not segmented"),
++    };
++    Ok((first, second, tx, op))
++}
++
++impl Segment {
++    /// Build from sorted full row keys that share the same `ATTR_PREFIX_LEN` prefix.
++    pub(crate) fn from_row_keys(index: u8, keys: &[Bytes]) -> Result<Self> {
++        let mut firsts = Vec::with_capacity(keys.len());
++        let mut seconds = Vec::with_capacity(keys.len());
++        let mut txs = Vec::with_capacity(keys.len());
++        let mut ops = vec![0u8; keys.len().div_ceil(8)];
++        for (i, key) in keys.iter().enumerate() {
++            let (first, second, tx, op) = split_row_key(index, &key[ATTR_PREFIX_LEN..])?;
++            firsts.push(first);
++            seconds.push(second);
++            txs.push(tx);
++            if op == codec::RETRACT {
++                ops[i / 8] |= 1 << (i % 8);
++            }
++        }
++        Ok(Segment {
++            index,
++            first: Column::from_encoded(&firsts),
++            second: Column::from_encoded(&seconds),
++            ops,
++            txs,
++        })
++    }
++
++    pub(crate) fn encode(&self) -> Vec<u8> {
++        let n = self.first.len();
++        let mut out = Vec::with_capacity(n * 8);
++        out.push(SEGMENT_VERSION);
++        out.push(self.index);
++        out.extend_from_slice(&(n as u32).to_le_bytes());
++        self.first.encode(&mut out);
++        self.second.encode(&mut out);
++        out.extend_from_slice(&(self.ops.len() as u32).to_le_bytes());
++        out.extend_from_slice(&self.ops);
++        let start = out.len();
++        out.extend_from_slice(&0u32.to_le_bytes());
++        encode_i64_column(&self.txs, &mut out);
++        let len = (out.len() - start - 4) as u32;
++        out[start..start + 4].copy_from_slice(&len.to_le_bytes());
++        out
++    }
++
++    fn header(buf: &[u8]) -> Result<(u8, usize, &[u8])> {
++        if buf.len() < 6 || buf[0] != SEGMENT_VERSION {
++            bail!("bad segment header");
++        }
++        let n = u32::from_le_bytes(buf[2..6].try_into().unwrap()) as usize;
++        Ok((buf[1], n, &buf[6..]))
++    }
++
++    fn take_column(buf: &[u8]) -> Result<(&[u8], &[u8])> {
++        if buf.len() < 4 {
++            bail!("segment column length truncated");
++        }
++        let len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
++        if buf.len() < 4 + len {
++            bail!("segment column truncated");
++        }
++        Ok((&buf[4..4 + len], &buf[4 + len..]))
++    }
++
++    /// Number of datoms without decoding any column.
++    pub(crate) fn count(buf: &[u8]) -> Result<usize> {
++        Ok(Self::header(buf)?.1)
++    }
++
++    pub(crate) fn decode(buf: &[u8]) -> Result<Self> {
++        let (index, n, rest) = Self::header(buf)?;
++        let (first, rest) = Self::take_column(rest)?;
++        let (second, rest) = Self::take_column(rest)?;
++        let (ops, rest) = Self::take_column(rest)?;
++        let (txs, _) = Self::take_column(rest)?;
++        Ok(Segment {
++            index,
++            first: Column::decode(first, n)?,
++            second: Column::decode(second, n)?,
++            ops: ops.to_vec(),
++            txs: decode_i64_column(txs, n)?,
++        })
++    }
++
++    /// Decode only the first column and the op bitmap (an AE/AV style scan).
++    pub(crate) fn decode_first_column(buf: &[u8]) -> Result<Self> {
++        let (index, n, rest) = Self::header(buf)?;
++        let (first, rest) = Self::take_column(rest)?;
++        let (_second, rest) = Self::take_column(rest)?;
++        let (ops, _) = Self::take_column(rest)?;
++        Ok(Segment {
++            index,
++            first: Column::decode(first, n)?,
++            second: Column::Raw {
++                offsets: vec![0],
++                bytes: Vec::new(),
++            },
++            ops: ops.to_vec(),
++            txs: Vec::new(),
++        })
++    }
++
++    pub(crate) fn len(&self) -> usize {
++        self.first.len()
++    }
++
++    #[inline]
++    pub(crate) fn is_retract(&self, i: usize) -> bool {
++        self.ops[i / 8] & (1 << (i % 8)) != 0
++    }
++
++    /// Full row key of datom `i` (attribute prefix included).
++    pub(crate) fn row_key(&self, attr_prefix: &[u8], i: usize) -> Vec<u8> {
++        let mut s1 = [0u8; 9];
++        let mut s2 = [0u8; 9];
++        let first = self.first.get(i, &mut s1);
++        let second = self.second.get(i, &mut s2);
++        let mut key = Vec::with_capacity(attr_prefix.len() + first.len() + second.len() + 9);
++        key.extend_from_slice(attr_prefix);
++        key.extend_from_slice(first);
++        key.extend_from_slice(second);
++        key.extend_from_slice(&codec::encode_i64_bytes(self.txs[i]));
++        key.push(if self.is_retract(i) {
++            codec::RETRACT
++        } else {
++            codec::ADD
++        });
++        key
++    }
++
++    /// Compare datom `i`'s key (without attribute prefix) against `target`,
++    /// which may be a prefix of a key or extend past the first column.
++    pub(crate) fn cmp_key(&self, i: usize, target: &[u8]) -> Ordering {
++        let mut s1 = [0u8; 9];
++        let mut s2 = [0u8; 9];
++        let tx = if self.txs.is_empty() {
++            [0u8; 8]
++        } else {
++            codec::encode_i64_bytes(self.txs[i])
++        };
++        let op = [if self.txs.is_empty() || !self.is_retract(i) {
++            codec::ADD
++        } else {
++            codec::RETRACT
++        }];
++        let has_tail = !self.txs.is_empty();
++        let parts: [&[u8]; 4] = [
++            self.first.get(i, &mut s1),
++            self.second.get(i, &mut s2),
++            if has_tail { &tx } else { &[] },
++            if has_tail { &op } else { &[] },
++        ];
++        cmp_parts(&parts, target)
++    }
++
++    /// Index of the first datom whose key is `>= target` (without attribute prefix).
++    pub(crate) fn lower_bound(&self, target: &[u8]) -> usize {
++        let (mut lo, mut hi) = (0, self.len());
++        while lo < hi {
++            let mid = (lo + hi) / 2;
++            if self.cmp_key(mid, target) == Ordering::Less {
++                lo = mid + 1;
++            } else {
++                hi = mid;
++            }
++        }
++        lo
++    }
++
++    /// Does datom `i`'s key (without attribute prefix) start with `prefix`?
++    pub(crate) fn key_starts_with(&self, i: usize, prefix: &[u8]) -> bool {
++        let mut s1 = [0u8; 9];
++        let mut s2 = [0u8; 9];
++        let first = self.first.get(i, &mut s1);
++        if prefix.len() <= first.len() {
++            return first.starts_with(prefix);
++        }
++        if !prefix.starts_with(first) {
++            return false;
++        }
++        let rest = &prefix[first.len()..];
++        let second = self.second.get(i, &mut s2);
++        if rest.len() <= second.len() {
++            return second.starts_with(rest);
++        }
++        // Prefixes never reach into the tx/op suffix.
++        false
++    }
++}
++
++/// Lexicographically compare the virtual concatenation of `parts` with `target`.
++fn cmp_parts(parts: &[&[u8]], target: &[u8]) -> Ordering {
++    let mut t = target;
++    for part in parts {
++        let n = part.len().min(t.len());
++        match part[..n].cmp(&t[..n]) {
++            Ordering::Equal => {}
++            other => return other,
++        }
++        if part.len() > n {
++            return Ordering::Greater;
++        }
++        t = &t[n..];
++    }
++    if t.is_empty() {
++        Ordering::Equal
++    } else {
++        Ordering::Less
++    }
++}
++
++/// Exclusive end of the attribute's key range, if one exists.
++pub(crate) fn attr_range_end(attr_prefix: &[u8]) -> Option<Vec<u8>> {
++    next_prefix(&attr_prefix[..ATTR_PREFIX_LEN])
++}
++
++// ---------------------------------------------------------------------------
++// Write path
++// ---------------------------------------------------------------------------
++
++/// Merge new full row keys for one segmented index into the existing segments.
++/// Keys are sorted, grouped by attribute, and each group is merged into the
++/// segments whose ranges cover it; the merged runs are re-chunked to `segment_size`.
++pub(crate) async fn merge_into_segments<D>(
++    db: &D,
++    batch: &mut WriteBatch,
++    index: u8,
++    mut keys: Vec<Bytes>,
++    segment_size: usize,
++) -> Result<()>
++where
++    D: DbReadOps + Sync,
++{
++    keys.sort();
++    keys.dedup();
++    let mut groups: BTreeMap<Vec<u8>, Vec<Bytes>> = BTreeMap::new();
++    for key in keys {
++        groups
++            .entry(key[..ATTR_PREFIX_LEN].to_vec())
++            .or_default()
++            .push(key);
++    }
++
++    for (attr_prefix, keys) in groups {
++        let mut iter = match attr_range_end(&attr_prefix) {
++            Some(end) => {
++                db.scan_with_options(attr_prefix.clone()..end, &DEFAULT_SCAN_OPTIONS)
++                    .await?
++            }
++            None => {
++                db.scan_with_options(attr_prefix.clone().., &DEFAULT_SCAN_OPTIONS)
++                    .await?
++            }
++        };
++        let mut i = 0;
++        while i < keys.len() {
++            iter.seek(&keys[i]).await?;
++            let existing = match iter.next().await? {
++                Some(kv) if kv.key.starts_with(&attr_prefix) => Some(kv),
++                _ => None,
++            };
++            let (mut merged, old_key) = match existing {
++                Some(kv) => {
++                    let segment = Segment::decode(&kv.value)?;
++                    let rows: Vec<Bytes> = (0..segment.len())
++                        .map(|r| Bytes::from(segment.row_key(&attr_prefix, r)))
++                        .collect();
++                    (rows, Some(kv.key))
++                }
++                None => (Vec::new(), None),
++            };
++            let end = match &old_key {
++                Some(seg_key) => keys[i..].partition_point(|k| k <= seg_key) + i,
++                None => keys.len(),
++            };
++            merged.extend_from_slice(&keys[i..end]);
++            merged.sort();
++            merged.dedup();
++            i = end;
++
++            let mut keep_old_key = false;
++            for chunk in merged.chunks(segment_size) {
++                let seg_key = chunk.last().unwrap();
++                if Some(seg_key) == old_key.as_ref() {
++                    keep_old_key = true;
++                }
++                let segment = Segment::from_row_keys(index, chunk)?;
++                batch.put(seg_key, segment.encode());
++            }
++            if let Some(seg_key) = old_key {
++                if !keep_old_key {
++                    batch.delete(seg_key);
++                }
++            }
++        }
++    }
++    Ok(())
++}
++
++// ---------------------------------------------------------------------------
++// Read helpers for non-query callers
++// ---------------------------------------------------------------------------
++
++/// All row keys under `prefix` (which must start with an attribute prefix),
++/// reconstructed from segments, in key order.
++pub(crate) async fn row_keys_with_prefix<D>(db: &D, prefix: &[u8]) -> Result<Vec<Bytes>>
++where
++    D: DbReadOps + Sync,
++{
++    if prefix.len() < ATTR_PREFIX_LEN {
++        bail!("segment prefix scans need at least an attribute prefix");
++    }
++    let attr_prefix = &prefix[..ATTR_PREFIX_LEN];
++    let mut iter = match attr_range_end(attr_prefix) {
++        Some(end) => {
++            db.scan_with_options(prefix.to_vec()..end, &DEFAULT_SCAN_OPTIONS)
++                .await?
++        }
++        None => {
++            db.scan_with_options(prefix.to_vec().., &DEFAULT_SCAN_OPTIONS)
++                .await?
++        }
++    };
++    let rest = &prefix[ATTR_PREFIX_LEN..];
++    let mut out = Vec::new();
++    while let Some(kv) = iter.next().await? {
++        let segment = Segment::decode(&kv.value)?;
++        let start = segment.lower_bound(rest);
++        for i in start..segment.len() {
++            if !segment.key_starts_with(i, rest) {
++                return Ok(out);
++            }
++            out.push(Bytes::from(segment.row_key(attr_prefix, i)));
++        }
++    }
++    Ok(out)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::codec::Encode;
++    use crate::ops::DataType;
++
++    fn row_key(index: u8, attr: i64, e: i64, v: &DataType, tx: i64, op: u8) -> Bytes {
++        let mut key = vec![index];
++        key.extend_from_slice(&codec::encode_i64_bytes(attr));
++        let e = DataType::Long(e).encode();
++        let v = v.encode();
++        match index {
++            codec::AEV => {
++                key.extend_from_slice(&e);
++                key.extend_from_slice(&v);
++            }
++            codec::AVE => {
++                key.extend_from_slice(&v);
++                key.extend_from_slice(&e);
++            }
++            _ => unreachable!(),
++        }
++        key.extend_from_slice(&codec::encode_i64_bytes(tx));
++        key.push(op);
++        Bytes::from(key)
++    }
++
++    #[test]
++    fn i64_column_roundtrip() {
++        let cases: Vec<Vec<i64>> = vec![
++            vec![],
++            vec![5],
++            vec![1, 2, 3, 4, 5],
++            vec![i64::MIN, i64::MAX, 0, -1],
++            (0..1000).map(|i| i * 7 - 300).collect(),
++        ];
++        for vals in cases {
++            let mut buf = Vec::new();
++            encode_i64_column(&vals, &mut buf);
++            assert_eq!(decode_i64_column(&buf, vals.len()).unwrap(), vals);
++        }
++    }
++
++    #[test]
++    fn segment_roundtrip_and_ordering() {
++        for index in [codec::AEV, codec::AVE] {
++            let mut keys: Vec<Bytes> = Vec::new();
++            for e in 0..50 {
++                for v in 0..3 {
++                    keys.push(row_key(
++                        index,
++                        7,
++                        e,
++                        &DataType::Long(v * 11),
++                        100 + e,
++                        codec::ADD,
++                    ));
++                }
++                keys.push(row_key(
++                    index,
++                    7,
++                    e,
++                    &DataType::String(format!("s{e}")),
++                    101,
++                    codec::RETRACT,
++                ));
++            }
++            keys.sort();
++            let attr_prefix = keys[0][..ATTR_PREFIX_LEN].to_vec();
++            let segment = Segment::from_row_keys(index, &keys).unwrap();
++            let decoded = Segment::decode(&segment.encode()).unwrap();
++            assert_eq!(decoded, segment);
++            for (i, key) in keys.iter().enumerate() {
++                assert_eq!(decoded.row_key(&attr_prefix, i), key.as_ref());
++                assert_eq!(decoded.cmp_key(i, &key[ATTR_PREFIX_LEN..]), Ordering::Equal);
++                assert_eq!(decoded.lower_bound(&key[ATTR_PREFIX_LEN..]), i);
++                assert!(decoded.key_starts_with(i, &key[ATTR_PREFIX_LEN..key.len() - 9]));
++            }
++            let first_only = Segment::decode_first_column(&segment.encode()).unwrap();
++            assert_eq!(first_only.first, segment.first);
++            assert_eq!(first_only.ops, segment.ops);
++        }
++    }
++
++    #[test]
++    fn all_long_values_pack_as_integers() {
++        let keys: Vec<Bytes> = (0..10)
++            .map(|e| row_key(codec::AEV, 1, e, &DataType::Long(e * 2), 5, codec::ADD))
++            .collect();
++        let segment = Segment::from_row_keys(codec::AEV, &keys).unwrap();
++        assert!(matches!(segment.second, Column::Longs(_)));
++        // 10 datoms: header + three tiny packed columns + bitmap is well under row size.
++        assert!(segment.encode().len() < keys.iter().map(|k| k.len()).sum::<usize>());
++    }
++}
+diff --git a/src/tx.rs b/src/tx.rs
+index 41d4914..ac00a33 100644
+--- a/src/tx.rs
++++ b/src/tx.rs
+@@ -15,6 +15,7 @@ use crate::metadata::PartitionMap;
+ use crate::ops::{DataType, Datom, DatomOp, Entid, EntityRef, TxOp};
+ use crate::partition::{extract_partition, DB_PARTITION, TX_PARTITION};
+ use crate::schema::{Schema, Unique, ValueType, DB_TX_ABORTED, DB_TX_COMMITTED};
++use crate::segment::SegmentLayout;
+ use crate::slate::DEFAULT_SCAN_OPTIONS;
+ use crate::transaction::TxKey;
+ use crate::util::{concat_bytes, next_prefix};
+@@ -616,6 +617,7 @@ pub(crate) fn validate_allocated_entity_ids(
+ pub(crate) async fn lookup_tx_completion<D>(
+     sdb: &D,
+     tx_key: TxKey,
++    layout: SegmentLayout,
+ ) -> Result<Option<TxCompletion>, Error>
+ where
+     D: DbReadOps + Sync,
+@@ -628,12 +630,21 @@ where
+         &encode_i64_bytes(crate::schema::DB_TX_ID),
+         &value_buf,
+     ]);
+-    let mut iter = sdb
+-        .scan_prefix_with_options(&ave_prefix, .., &DEFAULT_SCAN_OPTIONS)
+-        .await?;
++    let ave_keys = if layout.is_columnar() {
++        crate::segment::row_keys_with_prefix(sdb, &ave_prefix).await?
++    } else {
++        let mut iter = sdb
++            .scan_prefix_with_options(&ave_prefix, .., &DEFAULT_SCAN_OPTIONS)
++            .await?;
++        let mut keys = Vec::new();
++        while let Some(kv) = iter.next().await? {
++            keys.push(kv.key);
++        }
++        keys
++    };
+     let mut tx_eid: Option<i64> = None;
+-    while let Some(kv) = iter.next().await? {
+-        let (_attribute, _value, entity, _tx_eid, op) = ave_key_to_parts(kv.key)?;
++    for key in ave_keys {
++        let (_attribute, _value, entity, _tx_eid, op) = ave_key_to_parts(key)?;
+         if op == codec::RETRACT {
+             continue;
+         }
+-- 
+2.51.2
+

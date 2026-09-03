@@ -1,0 +1,49 @@
+From f1b79d207bc8b8fc3add59f43172768ede11a9d3 Mon Sep 17 00:00:00 2001
+From: Ben Lovell <ben.j.lovell@gmail.com>
+Date: Thu, 3 Sep 2026 20:57:57 +0200
+Subject: [PATCH 16/20] wip(combo-vec-seg): full suite passes with both toggles
+ on; clippy clean; fmt
+
+---
+ PROGRESS.md    | 7 ++++++-
+ src/segment.rs | 5 +++--
+ 2 files changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/PROGRESS.md b/PROGRESS.md
+index ccdcb53..2c4e35a 100644
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -25,8 +25,13 @@ Each source branch has an EXPERIMENT.md (design, toggle env var names, hook poin
+   never sees a segment). Split `run(size)` into `load(size)` + `run(size)` to reuse the fixture.
+   Passes.
+ 
++- Toggles ON (`TRIPLOX_BATCHED_JOIN=1 TRIPLOX_SEGMENT_SIZE=256`): 615 lib + 32 integration, all pass.
++- `cargo clippy -p triplox --all-targets`: clean. (Both toggles are read at runtime from env, so
++  clippy output cannot differ between arms; one run covers both.)
++- `cargo fmt` applied.
++
+ ## Next
+-1. Full suite with all toggles on (running).
++1. Interleaved bench (script: scratchpad/run-combo-bench.sh), 3 passes x 4 arms, RUNS=5.
+ 2. Interleaved bench: off / batched-only / segments-only / all-on, 3 passes.
+ 3. COMBINED.md.
+ 
+diff --git a/src/segment.rs b/src/segment.rs
+index bb391c6..d4b7dda 100644
+--- a/src/segment.rs
++++ b/src/segment.rs
+@@ -708,8 +708,9 @@ mod tests {
+                         GenericJoinEngine::execute(&stages, BindingBag::unit())
+                     })
+                     .expect("row engine");
+-                    let batched = tokio::task::block_in_place(|| BatchedJoinEngine::execute(&stages))
+-                        .expect("batched engine");
++                    let batched =
++                        tokio::task::block_in_place(|| BatchedJoinEngine::execute(&stages))
++                            .expect("batched engine");
+                     assert_eq!(batched.variables, rows.variables, "layout for {q}");
+                     assert_eq!(batched.rows, rows.rows, "rows for {q}");
+                     assert!(!rows.rows.is_empty(), "{q} produced no rows to compare");
+-- 
+2.51.2
+
