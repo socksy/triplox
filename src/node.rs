@@ -261,6 +261,7 @@ impl<L: TxLog> Node<L> {
             handle,
             tx_key,
             range_stats,
+            self.slate.zone_maps.clone(),
         ))
     }
 
@@ -331,7 +332,14 @@ impl<L: TxLog> QueryNode for Node<L> {
             .clone();
         let handle = Handle::current();
         let range_stats = self.slate.range_stats.clone();
-        DB::from_latest_sdb(self.slate.db.clone(), ident_map, handle, range_stats).await
+        DB::from_latest_sdb(
+            self.slate.db.clone(),
+            ident_map,
+            handle,
+            range_stats,
+            self.slate.zone_maps.clone(),
+        )
+        .await
     }
 
     async fn db_as_of(&self, tx_key: TxKey) -> Result<DB, Error> {

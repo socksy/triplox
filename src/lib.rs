@@ -33,6 +33,7 @@ pub mod tx;
 mod union_find;
 pub mod upsert_resolution;
 mod util;
+pub mod zone_map;
 
 pub mod config;
 pub mod node;

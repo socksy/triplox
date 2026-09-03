@@ -13,7 +13,8 @@ use crate::iterator::slate_iterator::{Extractor, Index, SlateIterator};
 use crate::iterator::temporal_filter_iterator::TemporalFilterIterator;
 use crate::query::binding_bag::{BindingBag, BindingRow};
 use crate::query::exec_pattern::{ExecPattern, PatternId, Proposal};
-use crate::util::make_extractor;
+use crate::util::{make_extractor, next_prefix};
+use crate::zone_map::ValueBounds;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TripleTerm {
@@ -47,6 +48,8 @@ where
     attribute: i64,
     value: TripleTerm,
     db: Arc<DB<D, M>>,
+    // Comparison bounds on the value variable pushed down by the planner.
+    value_bounds: Option<ValueBounds>,
 }
 
 impl<D, M> TriplePattern<D, M>
@@ -80,7 +83,13 @@ where
             attribute,
             value,
             db,
+            value_bounds: None,
         })
+    }
+
+    pub(crate) fn with_value_bounds(mut self, value_bounds: Option<ValueBounds>) -> Self {
+        self.value_bounds = value_bounds.filter(|bounds| !bounds.is_empty());
+        self
     }
 
     fn base_prefix(&self, index_type: IndexType) -> Result<Vec<u8>> {
@@ -131,13 +140,17 @@ where
                 Arc::clone(self.db.range_stats()),
             )?)),
             IndexType::EAV | IndexType::AVE | IndexType::AEV | IndexType::VAE => {
-                Ok(Box::new(TemporalFilterIterator::new(
+                let zone_map = self
+                    .db
+                    .zone_map(codec::index_type_to_prefix(index_type)?, self.attribute)?;
+                Ok(Box::new(TemporalFilterIterator::new_with_zone_map(
                     &prefix,
                     self.db.sdb(),
                     self.db.handle().clone(),
                     extractor,
                     self.db.as_of(),
                     Arc::clone(self.db.range_stats()),
+                    zone_map,
                 )?))
             }
         }
@@ -201,10 +214,27 @@ where
                 }
 
                 let mut iterator = self.attr_var_pair_iterator(index_type)?;
+                // With V bounds on an AEV scan, the zone map can rule out an entity's
+                // whole key range before seeking to it.
+                let zone_map = match (position, &self.value_bounds) {
+                    (TriplePosition::Value, Some(_)) => {
+                        self.db.zone_map(codec::AEV, self.attribute)?
+                    }
+                    _ => None,
+                };
+                let base_prefix = self.base_prefix(index_type)?;
                 // A bound E or V constrains the scan, which still advances only once.
                 for (first, row_indexes) in groups {
                     if !iterator.has_next() {
                         break;
+                    }
+                    if let (Some(zone_map), Some(bounds)) = (&zone_map, &self.value_bounds) {
+                        let mut lo = base_prefix.clone();
+                        lo.extend_from_slice(first);
+                        let hi = next_prefix(&lo);
+                        if !zone_map.range_may_match(&lo, hi.as_deref(), bounds) {
+                            continue;
+                        }
                     }
                     iterator.seek(first.clone())?;
 
@@ -226,8 +256,27 @@ where
             TripleTerm::Variable(_) => {
                 let index_type = Self::index_type(position, false);
                 let mut iterator = self.attr_var_iterator(index_type)?;
+                let bounds = match position {
+                    TriplePosition::Value => self.value_bounds.as_ref(),
+                    TriplePosition::Entity => None,
+                };
+                // AV is sorted by value, so a lower bound is a seek and an upper bound ends the scan.
+                if let (Some(bounds), Some(first)) = (bounds, iterator.get_value()?) {
+                    if let Some(target) = bounds.seek_target(&first) {
+                        iterator.seek(target.clone())?;
+                    }
+                }
                 let mut candidates = Vec::new();
                 while let Some(value) = iterator.get_value()? {
+                    if let Some(bounds) = bounds {
+                        if bounds.above_upper(&value) {
+                            break;
+                        }
+                        if bounds.excludes(&value) {
+                            iterator.next()?;
+                            continue;
+                        }
+                    }
                     candidates.push(vec![value]);
                     iterator.next()?;
                 }

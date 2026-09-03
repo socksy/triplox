@@ -4,14 +4,17 @@
 //!
 //! Run: `cargo bench --bench datalog_bench`
 //! Env: VERTICES (default 2000), EDGE_PROB (default 0.01), RUNS (default 5),
-//!      BENCH_OUT (optional path for JSON results).
+//!      BENCH_OUT (optional path for JSON results), ASOF=1 to add as-of queries
+//!      at the basis after vertex ingest and half-way through edge ingest.
+//!      Zone map skip counters are printed when TRIPLOX_ZONE_MAPS=1.
 
 use std::time::Instant;
 
 use edn::kw;
 use edn::Keyword;
 use triplox::ops::{DataType, EntityRef, TxOp};
-use triplox::{Database, Node, QueryNode, SubmitNode, TransactionResult};
+use triplox::{Database, Node, QueryNode, SubmitNode, TransactionResult, DB};
+use triplox_client::transaction::TxKey;
 
 struct XorShift(u64);
 
@@ -76,9 +79,9 @@ fn gnp_edges(n: i64, p: f64, seed: u64) -> Vec<(i64, i64)> {
     edges
 }
 
-async fn commit(node: &impl SubmitNode, ops: Vec<TxOp>) {
+async fn commit(node: &impl SubmitNode, ops: Vec<TxOp>) -> TxKey {
     match node.execute_tx(ops).await.expect("tx should execute") {
-        TransactionResult::TxCommitted(_) => {}
+        TransactionResult::TxCommitted(tx_key) => tx_key,
         TransactionResult::TxAborted(_, err) => panic!("tx aborted: {err}"),
     }
 }
@@ -126,6 +129,7 @@ async fn main() {
     let edge_prob: f64 = env_or("EDGE_PROB", 0.01);
     let runs: usize = env_or("RUNS", 5);
     let batch: usize = env_or("BATCH_SIZE", 1000);
+    let asof: bool = env_or("ASOF", 0u8) == 1;
 
     let node = Node::memory_node().await;
     commit(&node, schema()).await;
@@ -140,9 +144,11 @@ async fn main() {
             ])
         })
         .collect();
+    let mut basis_vertices = None;
     for chunk in vertex_ops.chunks(batch) {
-        commit(&node, chunk.to_vec()).await;
+        basis_vertices = Some(commit(&node, chunk.to_vec()).await);
     }
+    let basis_vertices = basis_vertices.expect("at least one vertex chunk");
 
     let db = node.db().await.expect("db");
     let rows = db
@@ -166,8 +172,13 @@ async fn main() {
             value: DataType::Long(eid[*to as usize]),
         })
         .collect();
-    for chunk in edge_ops.chunks(batch) {
-        commit(&node, chunk.to_vec()).await;
+    let chunks: Vec<&[TxOp]> = edge_ops.chunks(batch).collect();
+    let mut basis_mid = basis_vertices;
+    for (index, chunk) in chunks.iter().enumerate() {
+        let tx_key = commit(&node, chunk.to_vec()).await;
+        if index + 1 == chunks.len() / 2 {
+            basis_mid = tx_key;
+        }
     }
     let ingest_ms = ingest_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -176,13 +187,27 @@ async fn main() {
         edges.len()
     );
     println!(
-        "{:<18} {:>10} {:>12} {:>12}",
-        "query", "rows", "min_ms", "median_ms"
+        "{:<22} {:>10} {:>12} {:>12} {:>10} {:>10} {:>8}",
+        "query", "rows", "min_ms", "median_ms", "v_skips", "t_skips", "build_ms"
     );
 
     let db = node.db().await.expect("db");
+    let mut queries: Vec<(String, &str, DB)> = QUERIES
+        .iter()
+        .map(|(name, q)| (name.to_string(), *q, db.clone()))
+        .collect();
+    if asof {
+        let db_vertices = node.db_as_of(basis_vertices).await.expect("db as of");
+        let db_mid = node.db_as_of(basis_mid).await.expect("db as of mid");
+        let out_degree = "[:find ?a (count ?b) :where [?a :g/to ?b]]";
+        let two_hop = "[:find (count ?c) :where [?a :g/to ?b] [?b :g/to ?c]]";
+        queries.push(("asof_out_degree".into(), out_degree, db_vertices.clone()));
+        queries.push(("asof_two_hop_count".into(), two_hop, db_vertices));
+        queries.push(("asof_mid_out_degree".into(), out_degree, db_mid));
+    }
     let mut json = Vec::new();
-    for (name, q) in QUERIES {
+    triplox::zone_map::take_stats();
+    for (name, q, db) in &queries {
         let mut times = Vec::with_capacity(runs);
         let mut rows = 0;
         for _ in 0..runs {
@@ -194,9 +219,18 @@ async fn main() {
         times.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let min = times[0];
         let median = times[times.len() / 2];
-        println!("{name:<18} {rows:>10} {min:>12.2} {median:>12.2}");
+        // Skip counts are per execution; builds happen once and are reported as a total.
+        let stats = triplox::zone_map::take_stats();
+        let v_skips = stats.seeks_skipped / runs as u64;
+        let t_skips = stats.runs_skipped_t / runs as u64;
+        let build_ms = stats.build_micros as f64 / 1000.0;
+        println!(
+            "{name:<22} {rows:>10} {min:>12.2} {median:>12.2} {v_skips:>10} {t_skips:>10} {build_ms:>8.2}"
+        );
         json.push(format!(
-            "{{\"query\":\"{name}\",\"rows\":{rows},\"min_ms\":{min:.3},\"median_ms\":{median:.3}}}"
+            "{{\"query\":\"{name}\",\"rows\":{rows},\"min_ms\":{min:.3},\"median_ms\":{median:.3},\"v_skips\":{v_skips},\"v_checks\":{},\"t_skips\":{t_skips},\"builds\":{},\"build_ms\":{build_ms:.3}}}",
+            stats.seeks_checked / runs as u64,
+            stats.builds
         ));
     }
 

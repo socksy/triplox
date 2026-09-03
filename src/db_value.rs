@@ -8,6 +8,7 @@ use crate::ops::QueryArg;
 use crate::partition::tx_eid_from_tx_id;
 use crate::query::{execute_query, QueryResult};
 use crate::schema::IdentMap;
+use crate::zone_map::{self, Component, ZoneMap, ZoneMapCache};
 use triplox_client::node::{Database, IntoQuery};
 use triplox_client::transaction::TxKey;
 
@@ -21,6 +22,7 @@ where
     handle: Handle,
     tx_key: TxKey,
     range_stats: Arc<slatedb_estimates::RangeStats<M>>,
+    zone_maps: Arc<ZoneMapCache>,
 }
 
 impl<D, M> Clone for DB<D, M>
@@ -35,6 +37,7 @@ where
             handle: self.handle.clone(),
             tx_key: self.tx_key,
             range_stats: Arc::clone(&self.range_stats),
+            zone_maps: Arc::clone(&self.zone_maps),
         }
     }
 }
@@ -51,6 +54,7 @@ where
         handle: Handle,
         tx_key: TxKey,
         range_stats: Arc<slatedb_estimates::RangeStats<M>>,
+        zone_maps: Arc<ZoneMapCache>,
     ) -> Self {
         Self {
             sdb,
@@ -58,6 +62,7 @@ where
             handle,
             tx_key,
             range_stats,
+            zone_maps,
         }
     }
 
@@ -67,6 +72,7 @@ where
         ident_map: IdentMap,
         handle: Handle,
         range_stats: Arc<slatedb_estimates::RangeStats<M>>,
+        zone_maps: Arc<ZoneMapCache>,
     ) -> Result<Self, Error> {
         let tx_key = latest_tx_key_from_sdb(sdb.as_ref()).await?;
         Ok(Self {
@@ -75,6 +81,7 @@ where
             handle,
             tx_key,
             range_stats,
+            zone_maps,
         })
     }
 
@@ -100,6 +107,30 @@ where
 
     pub(crate) fn range_stats(&self) -> &Arc<slatedb_estimates::RangeStats<M>> {
         &self.range_stats
+    }
+
+    /// Zone map for one `(index, attribute)` prefix, built on first use and reused
+    /// for any basis at or before the one it was built at. `None` when disabled or
+    /// when the index has no zone map component.
+    pub(crate) fn zone_map(
+        &self,
+        index: u8,
+        attribute: i64,
+    ) -> Result<Option<Arc<ZoneMap>>, Error> {
+        if !zone_map::enabled() {
+            return Ok(None);
+        }
+        let Some(component) = Component::for_index(index) else {
+            return Ok(None);
+        };
+        let map = self
+            .zone_maps
+            .get_or_build(index, attribute, self.tx_key.tx_id, || {
+                let mut prefix = vec![index];
+                crate::codec::encode_i64(attribute, &mut prefix);
+                ZoneMap::build(&prefix, self.sdb.as_ref(), &self.handle, component)
+            })?;
+        Ok(Some(map))
     }
 }
 

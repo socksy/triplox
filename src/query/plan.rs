@@ -11,7 +11,7 @@ use slatedb::{DbMetadataOps, DbReadOps};
 
 use crate::codec::Encode;
 use crate::db_value::DB;
-use crate::expr::{expr_variables, Expr};
+use crate::expr::{expr_variables, BinaryOp, Expr};
 use crate::ops::{DataType, QueryArg};
 use crate::query::{
     convert_predicate, convert_where_fn, non_value_place_to_datatype, pattern_variables,
@@ -27,6 +27,7 @@ use super::patterns::predicate::PredicatePattern;
 use super::patterns::relation::RelationPattern;
 use super::patterns::triple::{TriplePattern, TripleTerm};
 use super::stage::Stage;
+use crate::zone_map::{self, ValueBounds};
 
 //////////////////////////////////
 // Descriptors
@@ -287,6 +288,8 @@ pub(crate) struct LogicalDescriptor {
     id: PatternId,
     variables: Vec<Variable>,
     kind: LogicalDescriptorKind,
+    // Comparison bounds pushed into a triple pattern's value scan (zone maps only).
+    value_bounds: Option<ValueBounds>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -374,13 +377,16 @@ impl LogicalDescriptor {
             LogicalDescriptorKind::Triple(pattern) => {
                 let attribute = resolve_attribute_from_pattern(&pattern.attribute, db.ident_map())
                     .with_context(|| format!("Failed to resolve triple pattern {}", self.id))?;
-                Ok(Arc::new(TriplePattern::new(
-                    self.id,
-                    entity_term(&pattern.entity)?,
-                    attribute,
-                    value_term(&pattern.value)?,
-                    db,
-                )?))
+                Ok(Arc::new(
+                    TriplePattern::new(
+                        self.id,
+                        entity_term(&pattern.entity)?,
+                        attribute,
+                        value_term(&pattern.value)?,
+                        db,
+                    )?
+                    .with_value_bounds(self.value_bounds.clone()),
+                ))
             }
             LogicalDescriptorKind::Relation { rows } => {
                 let encoded_rows = rows
@@ -808,10 +814,92 @@ fn plan_stages(
     }
 }
 
+// `[(op ?v literal)]` or `[(op literal ?v)]` with a comparison op on an orderable literal.
+fn comparison_bound(expression: &Expr) -> Option<(&Variable, BinaryOp, &DataType)> {
+    let Expr::BinaryExpr(binary) = expression else {
+        return None;
+    };
+    let (variable, op, literal) = match (binary.left.as_ref(), binary.right.as_ref()) {
+        (Expr::Variable(variable), Expr::Literal(literal)) => {
+            (variable, binary.op.clone(), literal)
+        }
+        (Expr::Literal(literal), Expr::Variable(variable)) => {
+            let flipped = match binary.op {
+                BinaryOp::Lt => BinaryOp::Gt,
+                BinaryOp::LtEq => BinaryOp::GtEq,
+                BinaryOp::Gt => BinaryOp::Lt,
+                BinaryOp::GtEq => BinaryOp::LtEq,
+                _ => return None,
+            };
+            (variable, flipped, literal)
+        }
+        _ => return None,
+    };
+    if !matches!(
+        op,
+        BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
+    ) {
+        return None;
+    }
+    // Only types whose key encoding preserves their comparison order.
+    if !matches!(
+        literal,
+        DataType::Long(_)
+            | DataType::BigInt(_)
+            | DataType::Double(_)
+            | DataType::Float(_)
+            | DataType::Instant(_)
+            | DataType::String(_)
+    ) {
+        return None;
+    }
+    Some((variable, op, literal))
+}
+
+// Bounds for every triple whose value variable is compared against a literal in this scope.
+fn pushdown_value_bounds(descriptors: &[Descriptor]) -> HashMap<PatternId, ValueBounds> {
+    if !zone_map::enabled() {
+        return HashMap::new();
+    }
+    let mut by_variable: HashMap<&Variable, ValueBounds> = HashMap::new();
+    for descriptor in descriptors {
+        let DescriptorKind::Predicate { expression } = &descriptor.kind else {
+            continue;
+        };
+        let Some((variable, op, literal)) = comparison_bound(expression) else {
+            continue;
+        };
+        let encoded = Bytes::from(literal.encode());
+        let bounds = by_variable.entry(variable).or_default();
+        match op {
+            BinaryOp::Gt => bounds.add_lower(encoded, false),
+            BinaryOp::GtEq => bounds.add_lower(encoded, true),
+            BinaryOp::Lt => bounds.add_upper(encoded, false),
+            BinaryOp::LtEq => bounds.add_upper(encoded, true),
+            _ => unreachable!("comparison_bound only returns comparison ops"),
+        }
+    }
+    descriptors
+        .iter()
+        .filter_map(|descriptor| {
+            let DescriptorKind::Triple(pattern) = &descriptor.kind else {
+                return None;
+            };
+            let PatternValuePlace::Variable(variable) = &pattern.value else {
+                return None;
+            };
+            by_variable
+                .get(variable)
+                .map(|bounds| (descriptor.id, bounds.clone()))
+        })
+        .collect()
+}
+
 fn plan_descriptor(
     descriptor: Descriptor,
     incoming_variables: Option<Vec<Variable>>,
     variable_order: &[Variable],
+    value_bounds: Option<ValueBounds>,
 ) -> Result<LogicalDescriptor> {
     let kind = match descriptor.kind {
         DescriptorKind::Triple(pattern) => LogicalDescriptorKind::Triple(pattern),
@@ -861,6 +949,7 @@ fn plan_descriptor(
         id: descriptor.id,
         variables: descriptor.variables,
         kind,
+        value_bounds,
     })
 }
 
@@ -882,6 +971,7 @@ fn plan_scope(
             .collect::<Vec<_>>()
     });
     let stages = plan_stages(&descriptors, variable_order, incoming_variables.as_deref())?;
+    let mut value_bounds = pushdown_value_bounds(&descriptors);
     let mut descriptor_input_layouts = HashMap::new();
     let mut previous_target: &[Variable] = &[];
     // TODO: This descriptor_input_layouts magic looks smelly. This should be one fold/walk over
@@ -925,7 +1015,8 @@ fn plan_scope(
                 }
                 _ => None,
             };
-            plan_descriptor(descriptor, descriptor_input_layout, variable_order)
+            let bounds = value_bounds.remove(&descriptor.id);
+            plan_descriptor(descriptor, descriptor_input_layout, variable_order, bounds)
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(LogicalPlan {
