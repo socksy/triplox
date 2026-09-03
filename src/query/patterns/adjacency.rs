@@ -252,6 +252,13 @@ impl ExecPattern for AdjacencyPattern {
         added: &[Variable],
     ) -> Result<Option<Vec<&'a [i64]>>> {
         let position = self.proposed_position(input, added)?;
+        // With the other side unbound every row's candidate set is the whole key list, which is
+        // no more selective than what another proposer offers, so let the engine choose instead.
+        if let TripleTerm::Variable(other) = self.other_term(position) {
+            if !input.column_indexes.contains_key(other) {
+                return Ok(None);
+            }
+        }
         let csr = self.csr_for(position);
         let sets = self
             .row_keys(input, position)?

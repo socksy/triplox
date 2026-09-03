@@ -17,13 +17,13 @@ RedisGraph/GraphBLAS-style: per (ref attribute, basis) build CSR adjacency from 
 - Medians (median of 3 run-medians, ms): triangles 575->20 (28.5x), two_hop_count 238->133 (1.8x), three_hop_count 7034->5589 (1.3x, very noisy), out_degree 47->6.7 (7.1x), in_degree_top 47->6.5 (7.2x), neighbors_of_42 1.40->0.03 (52x), weight_filter/weight_sum/label_lookup unchanged (no ref attr), heavy_neighbors 69->668 (9.6x SLOWER - regression to explain).
 - Matrix: attr :g/to, nnz=39764, rows_out=2000, rows_in=2000, bytes=1451992 (1.45 MB, ~36 B/edge across both orientations), build_ms ~38-40 once per (attr, tx).
 - ROOT CAUSE of the heavy_neighbors regression, measured with temporary stage instrumentation (since removed): in `[?a :g/to ?b] [?b :g/weight ?w] [(> ?w 950)]` the stage adding ?b has two proposers. `slatedb_estimates::RangeStats::estimate_key_count_with_prefix` returns **0** for every prefix on this dataset (all data still memtable/WAL-resident, no SST stats), so with the toggle off both proposers report count 0, the tie goes to the first proposer, and the `:g/to` pattern proposes ~20 rows per ?a. With the toggle on, AdjacencyPattern reports the TRUE nnz (7..37) and therefore LOSES to the estimator's 0; the `:g/weight` pattern proposes all 2000 entities per row = 4,000,000 rows, later validated down to 39764. An exact counter loses to an estimator that lies low. This is a pre-existing cost-model bug that the matrix exposes, not an adjacency-execution problem.
+- SECOND FIX: `AdjacencyPattern::candidate_sets` now returns None when the other side of the pattern is unbound (every row's set would be the whole key list, no more selective than any other proposer). Without this, `neighbors_of_42` regressed 0.03ms -> 0.53ms because the adjacency pattern's all-keys "set" demoted the selective `[?a :g/id 42]` lookup to a validator.
 - FIXED in `GenericJoinEngine::execute_intersecting_stage`: it now intersects the candidate sets of the proposers that CAN supply them and demotes the rest to validators (previously it bailed unless every proposer supplied a set). Any stage with at least one adjacency proposer now bypasses the broken cost model. heavy_neighbors ON went 668ms -> ~42ms (vs ~70-80ms OFF). Tests and clippy still clean off and on.
 - NOTE: this machine's disk hit 100% mid-experiment (concurrent agents). Keep bench outputs tiny; do not start large new builds without checking `df -k /`.
 
 ## Next
-1. Re-run the interleaved A/B bench with the mixed-intersection fix in place (the earlier numbers predate it).
-2. Optional VERTICES=5000 EDGE_PROB=0.004 run.
-3. EXPERIMENT.md, fmt, commit.
+1. Final interleaved A/B bench with both fixes (running).
+2. EXPERIMENT.md, fmt, commit.
 
 ## Shared context
 
