@@ -26,9 +26,36 @@ segments, adjacency matrices, matrix algebra) plus the `experiments/` directory;
   writes through a `KeySink` with one arm per layout. The CDC tx-eid filter from
   datom-segments is in `src/slate/cdc.rs`.
 
+- Verification, `cargo test -p triplox`, lib-test counts (plus 23 client_server + 3
+  fixture_compat + 6 subscription passing in every arm):
+
+  | configuration | result |
+  |---|---|
+  | no toggles | 637 pass, 0 fail |
+  | `TRIPLOX_BATCHED_JOIN=1` | 637 pass, 0 fail |
+  | `TRIPLOX_ADJ_MATRIX=1 TRIPLOX_MATRIX_ALGEBRA=1` | 637 pass, 0 fail |
+  | `TRIPLOX_ZONE_MAPS=1` | 637 pass, 0 fail |
+  | `TRIPLOX_SEGMENT_LAYOUT=row-segments TRIPLOX_SEGMENT_SIZE=256` | 637 pass, 0 fail |
+  | `TRIPLOX_SEGMENT_LAYOUT=columnar TRIPLOX_SEGMENT_SIZE=1024` | 629 pass, 8 fail |
+  | batched + columnar + adj + algebra + zone | 629 pass, 8 fail |
+
+  The 8 columnar failures are a strict subset of the 11 documented in COMBINED.md: they seed
+  SlateDB with raw AEV/AVE/AE/AV row keys and read back through the query engine, which
+  reports `bad segment header` under a segmented layout. Three of the documented 11 now
+  pass: the two `test_lookup_tx_completion_*` tests hardcoded `SegmentLayout::Row` while
+  the node they built wrote in the layout from the environment, and
+  `count_applies_bound_term_estimate_to_each_duplicate_row` compared a raw SlateDB key count
+  against an estimate the planner scales to datoms. Both expectations now follow the layout.
+- Three test-side fixes the integration needed: the indexer's raw-key test helpers read
+  through `KeyCursor`; `zone_map::tests::seeded_node` pins `SegmentLayout::Row`; and the
+  zone map's prune counters are only asserted when the row engine runs the query, because
+  per-entity seek pruning has no batched-engine equivalent.
+- `cargo clippy -p triplox --all-targets`: zero warnings. `cargo fmt` applied.
+- experiments/README.md rewritten: PDF link at the top, all six toggles, and what the report
+  did and did not measure on this tree. `experiments/report/` refreshed.
+
 ## Next
-- Verification: cargo test per configuration, clippy, fmt, row-count equivalence across arms.
-- experiments/README.md update.
+- Row-count equivalence across arms, then the final commit and push to `fork`.
 
 ---
 
