@@ -13,9 +13,11 @@ use slatedb::{DbMetadataOps, DbReadOps};
 use crate::codec::{self, decode_datatype, encode_datatype};
 use crate::db_value::DB;
 use crate::index::IndexType;
+use crate::iterator::segment_iterator::SegmentIterator;
 use crate::iterator::slate_iterator::{Extractor, Index};
 use crate::iterator::temporal_filter_iterator::TemporalFilterIterator;
 use crate::ops::DataType;
+use crate::segment::SegmentLayout;
 
 pub(crate) fn encode_entity(id: i64) -> Bytes {
     let mut buf = Vec::with_capacity(codec::ENTITY_LENGTH);
@@ -155,14 +157,27 @@ impl AdjMatrix {
         let prefix_len = prefix.len();
         let extractor: Extractor =
             Box::new(move |key| key.slice(prefix_len..key.len() - codec::TX_EID_OP_SUFFIX));
-        let mut iterator = TemporalFilterIterator::new(
-            &prefix,
-            db.sdb(),
-            db.handle().clone(),
-            extractor,
-            db.as_of(),
-            Arc::clone(db.range_stats()),
-        )?;
+        // Columnar AEV has no row keys, so the scan has to go through the segment iterator.
+        let mut iterator: Box<dyn Index> = match db.layout() {
+            SegmentLayout::Columnar { segment_size } => Box::new(SegmentIterator::new(
+                IndexType::AEV,
+                &prefix,
+                db.sdb(),
+                db.handle().clone(),
+                extractor,
+                db.as_of(),
+                Arc::clone(db.range_stats()),
+                segment_size,
+            )?),
+            _ => Box::new(TemporalFilterIterator::new(
+                &prefix,
+                db.sdb(),
+                db.handle().clone(),
+                extractor,
+                db.as_of(),
+                Arc::clone(db.range_stats()),
+            )?),
+        };
 
         let mut pairs = Vec::new();
         while let Some(ev) = iterator.get_value()? {

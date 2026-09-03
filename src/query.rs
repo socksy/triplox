@@ -751,7 +751,17 @@ where
     let logical_plan = build_logical_plan(query, args)?;
     let output_variables = logical_plan.output_variables().to_vec();
     let stages = logical_plan.materialize(db, None)?;
-    let bindings = if batched_join_enabled() && BatchedJoinEngine::supports(&stages) {
+    let batched = batched_join_enabled() && BatchedJoinEngine::supports(&stages);
+    // TRIPLOX_ENGINE_LOG=1 reports the engine actually chosen, so a silent fallback is visible.
+    if std::env::var_os("TRIPLOX_ENGINE_LOG").is_some() {
+        eprintln!(
+            "engine={} batched_toggle={} supported={}",
+            if batched { "batched" } else { "row" },
+            batched_join_enabled(),
+            BatchedJoinEngine::supports(&stages)
+        );
+    }
+    let bindings = if batched {
         BatchedJoinEngine::execute(&stages)?
     } else {
         GenericJoinEngine::execute(&stages, BindingBag::unit())?
