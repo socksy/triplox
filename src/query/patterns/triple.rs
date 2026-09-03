@@ -260,7 +260,8 @@ where
                     TriplePosition::Value => self.value_bounds.as_ref(),
                     TriplePosition::Entity => None,
                 };
-                // AV is sorted by value, so a lower bound is a seek and an upper bound ends the scan.
+                // The AV index is sorted by encoded value, so one bound becomes a seek and
+                // the other ends the scan (which is which depends on the encoding direction).
                 if let (Some(bounds), Some(first)) = (bounds, iterator.get_value()?) {
                     if let Some(target) = bounds.seek_target(&first) {
                         iterator.seek(target.clone())?;
@@ -269,7 +270,7 @@ where
                 let mut candidates = Vec::new();
                 while let Some(value) = iterator.get_value()? {
                     if let Some(bounds) = bounds {
-                        if bounds.above_upper(&value) {
+                        if bounds.past_byte_end(&value) {
                             break;
                         }
                         if bounds.excludes(&value) {

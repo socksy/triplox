@@ -3,28 +3,29 @@
 ## Goal
 Per-run (RUN_SIZE keys in key order) min/max of the non-prefix component (V for AEV, E for AVE) plus oldest/newest tx id, per (index, attribute), built in memory by scanning the prefix and cached per basis (sound for any basis <= build basis, see module doc). Planner pushes comparison predicates on a single-pattern variable into the scan as V bounds; iterators skip runs. Toggle: TRIPLOX_ZONE_MAPS=1. Also measure an as-of query at an early basis.
 
-## Status (as of hand-off)
-- Compiles clean (`cargo check -p triplox --lib --tests`, `cargo check --all-targets`).
-- Plumbing is complete: planner pushdown (src/query/plan.rs), AEV per-entity seek pruning and
-  AV sorted-scan seek/early-exit (src/query/patterns/triple.rs), temporal run skipping
-  (src/iterator/temporal_filter_iterator.rs), cache on SlateComponents (src/slate/mod.rs).
-- New tests in src/zone_map.rs: `results_match_with_zone_maps_on_and_off` (10 queries x
-  {latest, as-of} x {cold cache, warm cache}) and `zone_map_prunes_and_counts_skips`
-  (asserts seeks_checked > 0 and seeks_skipped > 0). NOT YET RUN - see disk note.
+## Status
+- BUG FOUND AND FIXED: `codec::encode_i64` is `value ^ i64::MAX`, which is strictly order
+  *reversing*, so Long/BigInt/Instant sort DESCENDING in index keys (floats and strings sort
+  ascending). The handed-over `ValueBounds` compared raw bytes assuming ascending order, so
+  every integer bound was inverted. `ValueBounds` now carries a per-type-tag `Direction` and
+  compares in value order; the AV sorted-scan path uses `seek_target`/`past_byte_end`, which
+  pick the upper bound as the seek target for descending encodings.
+- `cargo test -p triplox --lib zone_map`: 8/8 pass, including
+  `results_match_with_zone_maps_on_and_off` (10 queries x {latest, as-of} x {cold, warm cache})
+  and `zone_map_prunes_and_counts_skips`.
+- KEY LIMITATION found: run pruning only fires when values correlate with key order. With
+  values scattered across the whole domain every run spans the whole range and nothing prunes.
+  The bench's `:g/weight = i % 1000` does correlate with entity id, so it prunes.
 
-### MACHINE DISK IS FULL (blocking)
-`/` fluctuates between ~145Mi and ~4Gi free; five agents share it. `cargo test` and
-`cargo bench` builds fail with ENOSPC mid-link. I deleted only this worktree's
-`target/release` (never `cargo clean`). Do not touch other worktrees' targets.
-Strategy: wait for free space with a background monitor, then build in this order -
-(1) `cargo test -p triplox --lib`, (2) `cargo clippy`, (3) `cargo bench` (release, biggest).
+### MACHINE DISK
+`/` swings between ~145Mi and ~32Gi free; five agents share it. Builds fail with ENOSPC
+mid-link when it is low; just retry. I deleted only this worktree's `target/release`.
+`target/tmp/retry_tests.sh <log> <cmd...>` waits for headroom and retries on ENOSPC.
 
 ## Next
-1. Verify pushdown and run-skipping work end to end (skip counters > 0 on weight_filter, rows still 198).
-2. Equivalence test on/off including >= vs > boundaries and an as-of query.
-3. cargo test -p triplox, clippy.
-4. A/B bench; report skipped runs per query; add an as-of query to your own runs.
-5. EXPERIMENT.md (include interaction with a future segment layout), fmt, commit.
+1. `cargo test -p triplox` (full), `cargo clippy -p triplox --all-targets`.
+2. A/B interleaved bench, 3 runs each, ASOF=1; write the two JSON files.
+3. EXPERIMENT.md, `cargo fmt`, commit.
 
 ## Shared context
 
