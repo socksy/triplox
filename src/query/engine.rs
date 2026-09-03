@@ -49,14 +49,19 @@ impl GenericJoinEngine {
         Ok(())
     }
 
-    // Intersects the candidate sets of every proposer when all of them can supply one.
+    // Intersects the candidate sets of the proposers that can supply one and validates with
+    // the rest. Skipped when no proposer can, because then there is nothing to intersect.
     fn execute_intersecting_stage(stage: &Stage, input: &BindingBag) -> Result<Option<BindingBag>> {
         let mut per_proposer = Vec::with_capacity(stage.proposers().len());
+        let mut suppliers = Vec::new();
         for proposer in stage.proposers() {
-            match proposer.candidate_sets(input, stage.added())? {
-                Some(sets) => per_proposer.push(sets),
-                None => return Ok(None),
+            if let Some(sets) = proposer.candidate_sets(input, stage.added())? {
+                per_proposer.push(sets);
+                suppliers.push(proposer.id());
             }
+        }
+        if per_proposer.is_empty() {
+            return Ok(None);
         }
         let extensions = (0..input.rows.len())
             .map(|row_index| {
@@ -70,11 +75,10 @@ impl GenericJoinEngine {
         let proposed = input
             .extend_rows(stage.added().to_vec(), extensions)?
             .reorder(stage.target_variables())?;
-        let proposer_ids: Vec<PatternId> = stage.proposers().map(|p| p.id()).collect();
         let validators = stage
             .participants()
             .iter()
-            .filter(|participant| !proposer_ids.contains(&participant.id()))
+            .filter(|participant| !suppliers.contains(&participant.id()))
             .map(|participant| participant.as_ref());
         Self::validate_all(proposed, validators).map(Some)
     }
