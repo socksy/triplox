@@ -13,6 +13,8 @@ use crate::iterator::slate_iterator::{Extractor, Index, SlateIterator};
 use crate::iterator::temporal_filter_iterator::TemporalFilterIterator;
 use crate::query::binding_bag::{BindingBag, BindingRow};
 use crate::query::exec_pattern::{ExecPattern, PatternId, Proposal};
+use crate::query::vectorized::batch::{Batch, ColumnView};
+use crate::query::vectorized::{sorted_rows, BatchPattern};
 use crate::util::make_extractor;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -596,6 +598,420 @@ where
         } else {
             self.propose(input, added)?.reorder(target_variables)
         }
+    }
+
+    fn as_batch(&self) -> Option<&dyn BatchPattern> {
+        Some(self)
+    }
+}
+
+// Walks `order` in runs of equal keys, which reproduces the ascending BTreeMap grouping the row
+// engine uses. `run` gets the first row of the group and all its rows, and returns false to stop
+// early once the underlying iterator is exhausted.
+fn for_each_group(
+    order: &[u32],
+    equal: impl Fn(u32, u32) -> bool,
+    mut run: impl FnMut(u32, &[u32]) -> Result<bool>,
+) -> Result<()> {
+    let mut start = 0;
+    while start < order.len() {
+        let mut end = start + 1;
+        while end < order.len() && equal(order[start], order[end]) {
+            end += 1;
+        }
+        if !run(order[start], &order[start..end])? {
+            break;
+        }
+        start = end;
+    }
+    Ok(())
+}
+
+fn ascending_rows(matches: &[bool]) -> Vec<u32> {
+    matches
+        .iter()
+        .enumerate()
+        .filter_map(|(row, matched)| matched.then_some(row as u32))
+        .collect()
+}
+
+impl<D, M> TriplePattern<D, M>
+where
+    D: DbReadOps + Send + Sync + 'static,
+    M: DbMetadataOps + Send + Sync + 'static,
+{
+    // Scans `iterator` for every distinct key of `view`, returning per-row `[start, end)` ranges
+    // into the returned value pool. Rows sharing a key share a range, so a group is scanned once
+    // and never copied.
+    fn grouped_extensions(
+        &self,
+        view: &ColumnView,
+        index_type: IndexType,
+    ) -> Result<(Vec<Bytes>, Vec<(u32, u32)>)> {
+        let order = sorted_rows(view.len(), |left, right| {
+            view.get(left as usize).cmp(view.get(right as usize))
+        });
+        let mut pool: Vec<Bytes> = Vec::new();
+        let mut ranges = vec![(0u32, 0u32); view.len()];
+        let mut iterator = self.attr_var_pair_iterator(index_type)?;
+        for_each_group(
+            &order,
+            |left, right| view.get(left as usize) == view.get(right as usize),
+            |key_row, rows| {
+                if !iterator.has_next() {
+                    return Ok(false);
+                }
+                let key = view.get(key_row as usize).clone();
+                iterator.seek(key.clone())?;
+                let start = pool.len() as u32;
+                while let Some(pair) = iterator.get_value()? {
+                    if !pair.starts_with(&key) {
+                        break;
+                    }
+                    pool.push(pair.slice(key.len()..));
+                    iterator.next()?;
+                }
+                let range = (start, pool.len() as u32);
+                for row in rows {
+                    ranges[*row as usize] = range;
+                }
+                Ok(true)
+            },
+        )?;
+        Ok((pool, ranges))
+    }
+
+    fn scan_all(&self, mut iterator: Box<dyn Index>) -> Result<Vec<Bytes>> {
+        let mut candidates = Vec::new();
+        while let Some(value) = iterator.get_value()? {
+            candidates.push(value);
+            iterator.next()?;
+        }
+        Ok(candidates)
+    }
+
+    fn constant_other_iterator(
+        &self,
+        index_type: IndexType,
+        constant: &Bytes,
+    ) -> Result<Box<dyn Index>> {
+        let mut prefix = self.base_prefix(index_type)?;
+        prefix.extend_from_slice(constant);
+        let prefix_len = prefix.len();
+        let extractor: Extractor =
+            Box::new(move |key| key.slice(prefix_len..key.len() - codec::TX_EID_OP_SUFFIX));
+        self.create_iterator(Bytes::from(prefix), index_type, extractor)
+    }
+
+    // One seek per distinct key, marking every row of the group.
+    fn validate_grouped(
+        &self,
+        batch: &Batch,
+        mut iterator: Box<dyn Index>,
+        key: impl Fn(u32) -> Bytes,
+        order: Vec<u32>,
+        equal: impl Fn(u32, u32) -> bool,
+    ) -> Result<Vec<bool>> {
+        let mut matches = vec![false; batch.len()];
+        for_each_group(&order, equal, |key_row, rows| {
+            if !iterator.has_next() {
+                return Ok(false);
+            }
+            let expected = key(key_row);
+            iterator.seek(expected.clone())?;
+            if iterator.get_value()?.as_ref() == Some(&expected) {
+                for row in rows {
+                    matches[*row as usize] = true;
+                }
+            }
+            Ok(true)
+        })?;
+        Ok(matches)
+    }
+
+    fn single_column_order(view: &ColumnView) -> (Vec<u32>, impl Fn(u32, u32) -> bool + '_) {
+        let order = sorted_rows(view.len(), |left, right| {
+            view.get(left as usize).cmp(view.get(right as usize))
+        });
+        (order, move |left: u32, right: u32| {
+            view.get(left as usize) == view.get(right as usize)
+        })
+    }
+}
+
+impl<D, M> BatchPattern for TriplePattern<D, M>
+where
+    D: DbReadOps + Send + Sync + 'static,
+    M: DbMetadataOps + Send + Sync + 'static,
+{
+    fn count_batch(
+        &self,
+        batch: &Batch,
+        added: &[Variable],
+        proposals: &mut [Proposal],
+    ) -> Result<()> {
+        ensure!(
+            proposals.len() == batch.len(),
+            "Triple pattern {} received {} proposals for {} input rows",
+            self.id,
+            proposals.len(),
+            batch.len()
+        );
+        ensure!(
+            added.len() == 1,
+            "Triple pattern {} can count exactly one variable, got {added:?}",
+            self.id
+        );
+        let Some(position) = self.position_for_variable(&added[0]) else {
+            let added = &added[0];
+            let vars = &self.variables;
+            bail!("Triple pattern can only count variables it can propose. Received {added}, variables {vars:?}")
+        };
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        let other = match position {
+            TriplePosition::Entity => &self.value,
+            TriplePosition::Value => &self.entity,
+        };
+        let other_resolved = match other {
+            TripleTerm::Variable(variable) => batch.contains(variable),
+            TripleTerm::Constant(_) => true,
+        };
+        let base_prefix = self.base_prefix(Self::index_type(position, other_resolved))?;
+
+        match other {
+            // One estimate per distinct bound value instead of one per row.
+            TripleTerm::Variable(other_var) if batch.contains(other_var) => {
+                let view = batch.view_of(other_var)?;
+                let (order, equal) = Self::single_column_order(&view);
+                for_each_group(&order, equal, |key_row, rows| {
+                    let mut prefix = base_prefix.clone();
+                    prefix.extend_from_slice(view.get(key_row as usize));
+                    let count = self.estimate_count(&prefix)?;
+                    for row in rows {
+                        proposals[*row as usize].consider(self.id, count);
+                    }
+                    Ok(true)
+                })?;
+            }
+            TripleTerm::Variable(_) => {
+                let count = self.estimate_count(&base_prefix)?;
+                for proposal in proposals.iter_mut() {
+                    proposal.consider(self.id, count);
+                }
+            }
+            TripleTerm::Constant(constant) => {
+                let mut prefix = base_prefix;
+                prefix.extend_from_slice(constant);
+                let count = self.estimate_count(&prefix)?;
+                for proposal in proposals.iter_mut() {
+                    proposal.consider(self.id, count);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn propose_batch(&self, batch: &Batch, added: &[Variable]) -> Result<(Vec<u32>, Vec<Bytes>)> {
+        ensure!(
+            added.len() == 1,
+            "Triple pattern {} can propose exactly one variable, got {added:?}",
+            self.id
+        );
+        ensure!(
+            !batch.contains(&added[0]),
+            "Triple pattern {} cannot add already-bound variable {}",
+            self.id,
+            added[0]
+        );
+        let position = self.position_for_variable(&added[0]).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Triple pattern {} cannot propose variable {}",
+                self.id,
+                added[0]
+            )
+        })?;
+        if batch.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        let other = match position {
+            TriplePosition::Entity => &self.value,
+            TriplePosition::Value => &self.entity,
+        };
+        match other {
+            TripleTerm::Variable(other_var) if batch.contains(other_var) => {
+                let view = batch.view_of(other_var)?;
+                let (pool, ranges) =
+                    self.grouped_extensions(&view, Self::index_type(position, true))?;
+                let total = ranges
+                    .iter()
+                    .map(|(start, end)| (end - start) as usize)
+                    .sum();
+                let mut parent_rows = Vec::with_capacity(total);
+                let mut values = Vec::with_capacity(total);
+                for (row, (start, end)) in ranges.iter().enumerate() {
+                    for index in *start..*end {
+                        parent_rows.push(row as u32);
+                        values.push(pool[index as usize].clone());
+                    }
+                }
+                Ok((parent_rows, values))
+            }
+            other => {
+                let candidates = match other {
+                    TripleTerm::Constant(constant) => self.scan_all(
+                        self.constant_other_iterator(Self::index_type(position, true), constant)?,
+                    )?,
+                    TripleTerm::Variable(_) => {
+                        self.scan_all(self.attr_var_iterator(Self::index_type(position, false))?)?
+                    }
+                };
+                let total = batch.len() * candidates.len();
+                let mut parent_rows = Vec::with_capacity(total);
+                let mut values = Vec::with_capacity(total);
+                for row in 0..batch.len() as u32 {
+                    for candidate in &candidates {
+                        parent_rows.push(row);
+                        values.push(candidate.clone());
+                    }
+                }
+                Ok((parent_rows, values))
+            }
+        }
+    }
+
+    fn validate_batch(&self, batch: &Batch) -> Result<Vec<u32>> {
+        let is_bound = |variable| batch.contains(variable);
+        ensure!(
+            self.variables.is_empty() || self.variables.iter().any(&is_bound),
+            "Triple pattern {} has no bound variables to validate",
+            self.id
+        );
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let matches = match (&self.entity, &self.value) {
+            (TripleTerm::Constant(entity), TripleTerm::Constant(value)) => {
+                let mut prefix = self.base_prefix(IndexType::AEV)?;
+                prefix.extend_from_slice(entity);
+                let extractor: Extractor =
+                    Box::new(move |key| make_extractor(2, IndexType::AEV)(key));
+                let mut iterator =
+                    self.create_iterator(Bytes::from(prefix), IndexType::AEV, extractor)?;
+                let has_match = if iterator.has_next() {
+                    iterator.seek(value.clone())?;
+                    iterator.get_value()?.as_ref() == Some(value)
+                } else {
+                    false
+                };
+                vec![has_match; batch.len()]
+            }
+
+            (TripleTerm::Variable(entity_var), TripleTerm::Constant(value))
+                if is_bound(entity_var) =>
+            {
+                let mut prefix = self.base_prefix(IndexType::AVE)?;
+                prefix.extend_from_slice(value);
+                let extractor: Extractor =
+                    Box::new(move |key| make_extractor(2, IndexType::AVE)(key));
+                let iterator =
+                    self.create_iterator(Bytes::from(prefix), IndexType::AVE, extractor)?;
+                let view = batch.view_of(entity_var)?;
+                let (order, equal) = Self::single_column_order(&view);
+                self.validate_grouped(
+                    batch,
+                    iterator,
+                    |row| view.get(row as usize).clone(),
+                    order,
+                    equal,
+                )?
+            }
+
+            (TripleTerm::Constant(entity), TripleTerm::Variable(value_var))
+                if is_bound(value_var) =>
+            {
+                let mut prefix = self.base_prefix(IndexType::AEV)?;
+                prefix.extend_from_slice(entity);
+                let extractor: Extractor =
+                    Box::new(move |key| make_extractor(2, IndexType::AEV)(key));
+                let iterator =
+                    self.create_iterator(Bytes::from(prefix), IndexType::AEV, extractor)?;
+                let view = batch.view_of(value_var)?;
+                let (order, equal) = Self::single_column_order(&view);
+                self.validate_grouped(
+                    batch,
+                    iterator,
+                    |row| view.get(row as usize).clone(),
+                    order,
+                    equal,
+                )?
+            }
+
+            (TripleTerm::Variable(entity_var), TripleTerm::Variable(value_var))
+                if is_bound(entity_var) && !is_bound(value_var) =>
+            {
+                let iterator = self.attr_var_iterator(IndexType::AE)?;
+                let view = batch.view_of(entity_var)?;
+                let (order, equal) = Self::single_column_order(&view);
+                self.validate_grouped(
+                    batch,
+                    iterator,
+                    |row| view.get(row as usize).clone(),
+                    order,
+                    equal,
+                )?
+            }
+
+            (TripleTerm::Variable(entity_var), TripleTerm::Variable(value_var))
+                if !is_bound(entity_var) && is_bound(value_var) =>
+            {
+                let iterator = self.attr_var_iterator(IndexType::AV)?;
+                let view = batch.view_of(value_var)?;
+                let (order, equal) = Self::single_column_order(&view);
+                self.validate_grouped(
+                    batch,
+                    iterator,
+                    |row| view.get(row as usize).clone(),
+                    order,
+                    equal,
+                )?
+            }
+
+            (TripleTerm::Variable(entity_var), TripleTerm::Variable(value_var))
+                if is_bound(entity_var) && is_bound(value_var) =>
+            {
+                let iterator = self.attr_var_pair_iterator(IndexType::AEV)?;
+                let entity_view = batch.view_of(entity_var)?;
+                let value_view = batch.view_of(value_var)?;
+                // Grouping follows the row engine's tuple order, not concatenated-key order.
+                let key_of =
+                    |row: u32| (entity_view.get(row as usize), value_view.get(row as usize));
+                let order =
+                    sorted_rows(batch.len(), |left, right| key_of(left).cmp(&key_of(right)));
+                self.validate_grouped(
+                    batch,
+                    iterator,
+                    |row| {
+                        let (entity, value) = key_of(row);
+                        let mut expected = Vec::with_capacity(entity.len() + value.len());
+                        expected.extend_from_slice(entity);
+                        expected.extend_from_slice(value);
+                        Bytes::from(expected)
+                    },
+                    order,
+                    |left, right| key_of(left) == key_of(right),
+                )?
+            }
+            _ => bail!(
+                "Triple pattern {} has no bound variables to validate",
+                self.id
+            ),
+        };
+        Ok(ascending_rows(&matches))
     }
 }
 

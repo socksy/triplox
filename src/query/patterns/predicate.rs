@@ -1,13 +1,17 @@
 use std::collections::HashMap;
 
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
+use bytes::Bytes;
 use edn::query::Variable;
 
 use super::evaluation::{binding_positions, update_bindings};
+use crate::codec::Decode;
 use crate::expr::{evaluate_as_bool, expr_variables, EvalContext, Expr};
 use crate::ops::DataType;
 use crate::query::binding_bag::{BindingBag, BindingRow};
-use crate::query::exec_pattern::{ExecPattern, PatternId};
+use crate::query::exec_pattern::{ExecPattern, PatternId, Proposal};
+use crate::query::vectorized::batch::Batch;
+use crate::query::vectorized::BatchPattern;
 
 pub(crate) struct PredicatePattern {
     id: PatternId,
@@ -80,6 +84,61 @@ impl ExecPattern for PredicatePattern {
             }
         }
         input.select_rows(&matches)
+    }
+
+    fn as_batch(&self) -> Option<&dyn BatchPattern> {
+        Some(self)
+    }
+}
+
+impl BatchPattern for PredicatePattern {
+    fn count_batch(
+        &self,
+        _batch: &Batch,
+        _added: &[Variable],
+        _proposals: &mut [Proposal],
+    ) -> Result<()> {
+        anyhow::bail!("Predicate pattern {} cannot propose", self.id)
+    }
+
+    fn propose_batch(&self, _batch: &Batch, added: &[Variable]) -> Result<(Vec<u32>, Vec<Bytes>)> {
+        anyhow::bail!(
+            "Predicate pattern {} cannot propose variables: {added:?}",
+            self.id
+        )
+    }
+
+    fn validate_batch(&self, batch: &Batch) -> Result<Vec<u32>> {
+        for variable in &self.variables {
+            ensure!(
+                batch.contains(variable),
+                "Predicate pattern {} requires bound variable {variable}",
+                self.id
+            );
+        }
+        let views = self
+            .variables
+            .iter()
+            .map(|variable| Ok((variable.clone(), batch.view_of(variable)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let mut bindings = HashMap::with_capacity(views.len());
+        let mut matches = Vec::new();
+        for row in 0..batch.len() {
+            for (variable, view) in &views {
+                let value = DataType::decode(view.get(row))
+                    .with_context(|| format!("Failed to decode expression variable {variable}"))?;
+                match bindings.get_mut(variable) {
+                    Some(binding) => *binding = value,
+                    None => {
+                        bindings.insert(variable.clone(), value);
+                    }
+                }
+            }
+            if evaluate_as_bool(&self.expression, &EvalContext::new(&bindings)) {
+                matches.push(row as u32);
+            }
+        }
+        Ok(matches)
     }
 }
 

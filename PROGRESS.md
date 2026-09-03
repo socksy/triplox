@@ -54,16 +54,25 @@ So the columnar batch attacks the right thing: replace per-row `Vec<Bytes>` with
 `Vec<u32>` parent-row map plus one `Vec<Bytes>` value column per level, and replace the
 BTreeMap grouping with a sort of row indices.
 
-### Code
-- src/query/vectorized/batch.rs only (Batch with Own/Parent columns and row maps, ColumnView),
-  not yet wired into the crate.
+### Code (built)
+- src/query/vectorized/batch.rs: Batch (Own/Parent columns, row maps), ColumnView, plus `concat`.
+- src/query/vectorized/mod.rs: `BatchPattern` trait (count_batch / propose_batch / validate_batch)
+  and `sorted_rows`.
+- src/query/vectorized/engine.rs: `BatchedJoinEngine` - same stage/proposal structure and the same
+  row ordering as `GenericJoinEngine`, columns instead of rows. `supports()` gates the path.
+- src/query/exec_pattern.rs: `ExecPattern::as_batch()` hook, default `None`.
+- src/query/patterns/triple.rs: `BatchPattern for TriplePattern`; grouping is a sort of row indices
+  instead of a `BTreeMap<&Bytes, Vec<usize>>`, extensions go into one value pool with per-row
+  ranges, `count_batch` estimates once per distinct key instead of once per row.
+- src/query/patterns/predicate.rs: `BatchPattern for PredicatePattern` (decodes through ColumnView).
+- src/query.rs: `TRIPLOX_BATCHED_JOIN` toggle in `execute_query`, falls back when unsupported.
+- src/query/vectorized/tests.rs: 10 queries run through both engines, rows compared exactly
+  (order included), plus a test that not/or is not claimed.
 
 ## Next
-1. Wire src/query/vectorized/mod.rs into the crate; write the batched engine for pure triple-pattern + predicate + aggregate queries first; fall back to the existing engine for not/or/rules.
-2. Toggle + equivalence test on/off on a small graph.
-3. cargo test -p triplox, clippy.
-4. A/B bench; include the profile top-10 in EXPERIMENT.md.
-5. EXPERIMENT.md, fmt, commit.
+1. cargo test -p triplox, clippy.
+2. A/B interleaved bench.
+3. EXPERIMENT.md, fmt, commit.
 
 ### Environment note
 The machine ran out of disk during this session (0 bytes free for a while; ~1.5 GiB free after).

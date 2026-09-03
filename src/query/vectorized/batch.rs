@@ -191,6 +191,35 @@ impl Batch {
         })
     }
 
+    // Appends batches with identical layouts. Concatenation is the one operation that has to
+    // materialize columns, so it is only used for multi-proposer stages.
+    pub(crate) fn concat(variables: Vec<Variable>, batches: &[Arc<Batch>]) -> Result<Batch> {
+        for batch in batches {
+            ensure!(
+                batch.variables == variables,
+                "Concatenated batches must share a layout, got {:?} and {variables:?}",
+                batch.variables
+            );
+        }
+        let len = batches.iter().map(|batch| batch.len).sum();
+        let columns = (0..variables.len())
+            .map(|column| {
+                let mut values = Vec::with_capacity(len);
+                for batch in batches {
+                    let view = batch.view(column);
+                    values.extend((0..view.len()).map(|row| view.get(row).clone()));
+                }
+                Column::Own(Arc::new(values))
+            })
+            .collect();
+        Ok(Batch {
+            variables,
+            columns,
+            parent: None,
+            len,
+        })
+    }
+
     pub(crate) fn chunks(self: &Arc<Self>, size: usize) -> Vec<Arc<Batch>> {
         if self.len <= size {
             return vec![Arc::clone(self)];
