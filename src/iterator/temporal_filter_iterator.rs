@@ -147,7 +147,7 @@ where
                         .and_then(|zm| zm.newer_run_end(&key, &self.as_of_encoded))
                     {
                         if end.starts_with(&self.prefix) {
-                            self.handle.block_on(self.inner.seek(&end))?;
+                            self.handle.block_on(self.inner.seek(end))?;
                         } else {
                             // The run extends past this scan's prefix: nothing visible remains.
                             self.current_key = None;
