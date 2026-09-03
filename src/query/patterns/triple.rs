@@ -9,10 +9,12 @@ use slatedb::{DbMetadataOps, DbReadOps};
 use crate::codec;
 use crate::db_value::DB;
 use crate::index::IndexType;
+use crate::iterator::segment_iterator::SegmentIterator;
 use crate::iterator::slate_iterator::{Extractor, Index, SlateIterator};
 use crate::iterator::temporal_filter_iterator::TemporalFilterIterator;
 use crate::query::binding_bag::{BindingBag, BindingRow};
 use crate::query::exec_pattern::{ExecPattern, PatternId, Proposal};
+use crate::segment::SegmentLayout;
 use crate::util::make_extractor;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -109,11 +111,32 @@ where
     }
 
     fn estimate_count(&self, prefix: &[u8]) -> Result<usize> {
-        let count = self
-            .db
-            .handle()
-            .block_on(self.db.range_stats().estimate_key_count_with_prefix(prefix))?;
-        Ok(usize::try_from(count)?)
+        let layout = self.db.layout();
+        // Segments are keyed once per `segment_size` datoms; AE/AV live in AEV/AVE segments.
+        let (prefix, scale) = match (layout, prefix[0]) {
+            (SegmentLayout::Columnar { segment_size }, codec::AE) => {
+                let mut p = prefix.to_vec();
+                p[0] = codec::AEV;
+                (p, segment_size)
+            }
+            (SegmentLayout::Columnar { segment_size }, codec::AV) => {
+                let mut p = prefix.to_vec();
+                p[0] = codec::AVE;
+                (p, segment_size)
+            }
+            (SegmentLayout::Columnar { segment_size }, index)
+                if crate::segment::is_segmented_index(index) =>
+            {
+                (prefix.to_vec(), segment_size)
+            }
+            _ => (prefix.to_vec(), 1),
+        };
+        let count = self.db.handle().block_on(
+            self.db
+                .range_stats()
+                .estimate_key_count_with_prefix(&prefix),
+        )?;
+        Ok(usize::try_from(count)?.saturating_mul(scale))
     }
 
     fn create_iterator(
@@ -122,6 +145,23 @@ where
         index_type: IndexType,
         extractor: Extractor,
     ) -> Result<Box<dyn Index>> {
+        if let SegmentLayout::Columnar { segment_size } = self.db.layout() {
+            if matches!(
+                index_type,
+                IndexType::AE | IndexType::AV | IndexType::AEV | IndexType::AVE
+            ) {
+                return Ok(Box::new(SegmentIterator::new(
+                    index_type,
+                    &prefix,
+                    self.db.sdb(),
+                    self.db.handle().clone(),
+                    extractor,
+                    self.db.as_of(),
+                    Arc::clone(self.db.range_stats()),
+                    segment_size,
+                )?));
+            }
+        }
         match index_type {
             IndexType::AE | IndexType::AV => Ok(Box::new(SlateIterator::new(
                 &prefix,

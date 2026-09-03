@@ -3,13 +3,14 @@ use std::sync::LazyLock;
 
 use crate::clock::st_from_unix_epoch;
 use crate::codec;
-use crate::indexer::{build_tx_entity_datoms, write_index_entries};
+use crate::indexer::{build_tx_entity_datoms, write_index_entries_with_layout};
 use crate::metadata::{Metadata, PartitionMap};
 use crate::partition::{
     extract_counter, partition_entity_prefix, COUNTER_BITS, DB_PARTITION, TX_PARTITION,
     USER_PARTITION,
 };
 use crate::schema::{bootstrap_schema, bootstrap_schema_tx, load_schema_from_indices, Schema};
+use crate::segment::SegmentLayout;
 use crate::slate::{SlateComponents, DEFAULT_SCAN_OPTIONS, DEFAULT_WRITE_OPTIONS};
 use crate::tempids;
 use crate::transaction::TxKey;
@@ -82,6 +83,13 @@ pub(crate) async fn scan_partition_counters(slatedb: &Db) -> Result<PartitionMap
 /// - **Existing DB**: loads the schema from indices via the Datalog query engine,
 ///   derives counters by scanning the EAV index.
 pub async fn init_db(slate: &SlateComponents) -> Result<Metadata> {
+    init_db_with_layout(slate, SegmentLayout::from_env()).await
+}
+
+pub async fn init_db_with_layout(
+    slate: &SlateComponents,
+    layout: SegmentLayout,
+) -> Result<Metadata> {
     let version_key = concat_bytes(&[&[codec::META_INDEX], META_KEY_VERSION]);
 
     match slate
@@ -131,7 +139,16 @@ pub async fn init_db(slate: &SlateComponents) -> Result<Metadata> {
             );
 
             let mut batch = WriteBatch::new();
-            write_index_entries(&mut batch, &datoms, &bootstrap_schema, BOOTSTRAP_TX_EID).unwrap();
+            write_index_entries_with_layout(
+                slate.db.as_ref(),
+                &mut batch,
+                &datoms,
+                &bootstrap_schema,
+                BOOTSTRAP_TX_EID,
+                layout,
+            )
+            .await
+            .unwrap();
             // Write version
             let version = env!("CARGO_PKG_VERSION");
             batch.put(&version_key, version.as_bytes());

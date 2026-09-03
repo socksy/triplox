@@ -8,6 +8,7 @@ use crate::ops::QueryArg;
 use crate::partition::tx_eid_from_tx_id;
 use crate::query::{execute_query, QueryResult};
 use crate::schema::IdentMap;
+use crate::segment::SegmentLayout;
 use triplox_client::node::{Database, IntoQuery};
 use triplox_client::transaction::TxKey;
 
@@ -21,6 +22,7 @@ where
     handle: Handle,
     tx_key: TxKey,
     range_stats: Arc<slatedb_estimates::RangeStats<M>>,
+    layout: SegmentLayout,
 }
 
 impl<D, M> Clone for DB<D, M>
@@ -35,6 +37,7 @@ where
             handle: self.handle.clone(),
             tx_key: self.tx_key,
             range_stats: Arc::clone(&self.range_stats),
+            layout: self.layout,
         }
     }
 }
@@ -58,7 +61,13 @@ where
             handle,
             tx_key,
             range_stats,
+            layout: SegmentLayout::from_env(),
         }
+    }
+
+    pub fn with_layout(mut self, layout: SegmentLayout) -> Self {
+        self.layout = layout;
+        self
     }
 
     /// Construct a DB from a SlateDB instance by scanning EAV for TX_PARTITION entities to find the latest TxKey.
@@ -75,11 +84,16 @@ where
             handle,
             tx_key,
             range_stats,
+            layout: SegmentLayout::from_env(),
         })
     }
 
     pub fn tx_key(&self) -> TxKey {
         self.tx_key
+    }
+
+    pub(crate) fn layout(&self) -> SegmentLayout {
+        self.layout
     }
 
     pub(crate) fn sdb(&self) -> &D {
