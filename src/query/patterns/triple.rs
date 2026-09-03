@@ -627,6 +627,9 @@ fn for_each_group(
     Ok(())
 }
 
+// Value pool plus one `[start, end)` slice of it per input row.
+type GroupedExtensions = (Vec<Bytes>, Vec<(u32, u32)>);
+
 fn ascending_rows(matches: &[bool]) -> Vec<u32> {
     matches
         .iter()
@@ -647,7 +650,7 @@ where
         &self,
         view: &ColumnView,
         index_type: IndexType,
-    ) -> Result<(Vec<Bytes>, Vec<(u32, u32)>)> {
+    ) -> Result<GroupedExtensions> {
         let order = sorted_rows(view.len(), |left, right| {
             view.get(left as usize).cmp(view.get(right as usize))
         });
