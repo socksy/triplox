@@ -83,3 +83,7 @@ unused = "allow"
 
 [profile.bench]
 debug-assertions = true
+
+[[bench]]
+name = "datalog_bench"
+harness = false
