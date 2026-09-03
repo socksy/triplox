@@ -216,6 +216,7 @@ async fn main() {
             times.push(start.elapsed().as_secs_f64() * 1000.0);
             rows = result.len();
         }
+        let samples: Vec<String> = times.iter().map(|t| format!("{t:.3}")).collect();
         times.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let min = times[0];
         let median = times[times.len() / 2];
@@ -228,9 +229,10 @@ async fn main() {
             "{name:<22} {rows:>10} {min:>12.2} {median:>12.2} {v_skips:>10} {t_skips:>10} {build_ms:>8.2}"
         );
         json.push(format!(
-            "{{\"query\":\"{name}\",\"rows\":{rows},\"min_ms\":{min:.3},\"median_ms\":{median:.3},\"v_skips\":{v_skips},\"v_checks\":{},\"t_skips\":{t_skips},\"builds\":{},\"build_ms\":{build_ms:.3}}}",
+            "{{\"query\":\"{name}\",\"rows\":{rows},\"min_ms\":{min:.3},\"median_ms\":{median:.3},\"v_skips\":{v_skips},\"v_checks\":{},\"t_skips\":{t_skips},\"builds\":{},\"build_ms\":{build_ms:.3},\"samples_ms\":[{}]}}",
             stats.seeks_checked / runs as u64,
-            stats.builds
+            stats.builds,
+            samples.join(",")
         ));
     }
 
