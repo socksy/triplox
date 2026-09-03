@@ -191,12 +191,14 @@ async fn main() {
             times.push(start.elapsed().as_secs_f64() * 1000.0);
             rows = result.len();
         }
+        let samples: Vec<String> = times.iter().map(|t| format!("{t:.3}")).collect();
         times.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let min = times[0];
         let median = times[times.len() / 2];
         println!("{name:<18} {rows:>10} {min:>12.2} {median:>12.2}");
         json.push(format!(
-            "{{\"query\":\"{name}\",\"rows\":{rows},\"min_ms\":{min:.3},\"median_ms\":{median:.3}}}"
+            "{{\"query\":\"{name}\",\"rows\":{rows},\"min_ms\":{min:.3},\"median_ms\":{median:.3},\"samples_ms\":[{}]}}",
+            samples.join(",")
         ));
     }
 
