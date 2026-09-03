@@ -52,6 +52,12 @@ pub(crate) fn adjacency_matrix_enabled() -> bool {
     std::env::var("TRIPLOX_ADJ_MATRIX").is_ok_and(|v| v == "1" || v == "true")
 }
 
+/// TRIPLOX_MATRIX_ALGEBRA=1 answers aggregate-only chain and triangle queries as matrix
+/// products. It has no effect without TRIPLOX_ADJ_MATRIX=1, which supplies the matrices.
+pub(crate) fn matrix_algebra_enabled() -> bool {
+    std::env::var("TRIPLOX_MATRIX_ALGEBRA").is_ok_and(|v| v == "1" || v == "true")
+}
+
 pub(crate) trait SchemaProvider: Send + Sync + 'static {
     fn schema(&self) -> impl Future<Output = Schema> + Send + '_;
 }
@@ -279,7 +285,12 @@ impl<L: TxLog> Node<L> {
             range_stats,
         )
         .with_layout(self.layout);
-        Ok(self.attach_adjacency(db, ref_attributes, adjacency_matrix_enabled()))
+        Ok(self.attach_adjacency(
+            db,
+            ref_attributes,
+            adjacency_matrix_enabled(),
+            matrix_algebra_enabled(),
+        ))
     }
 
     async fn schema_maps(&self) -> (IdentMap, HashSet<i64>) {
@@ -294,9 +305,16 @@ impl<L: TxLog> Node<L> {
         (schema.ident_map.clone(), ref_attributes)
     }
 
-    fn attach_adjacency(&self, db: DB, ref_attributes: HashSet<i64>, enabled: bool) -> DB {
+    fn attach_adjacency(
+        &self,
+        db: DB,
+        ref_attributes: HashSet<i64>,
+        enabled: bool,
+        algebra: bool,
+    ) -> DB {
         if enabled {
             db.with_adjacency(Arc::clone(&self.adjacency_cache), ref_attributes)
+                .with_matrix_algebra(algebra)
         } else {
             db
         }
@@ -304,13 +322,31 @@ impl<L: TxLog> Node<L> {
 
     /// Latest DB with adjacency matrices explicitly on or off, regardless of the env toggle.
     pub(crate) async fn db_with_adjacency(&self, enabled: bool) -> Result<DB, Error> {
+        self.db_with_modes(enabled, false).await
+    }
+
+    /// As-of DB with the adjacency and matrix-algebra toggles set explicitly.
+    #[cfg(test)]
+    pub(crate) async fn db_as_of_with_modes(
+        &self,
+        tx_key: TxKey,
+        adjacency: bool,
+        algebra: bool,
+    ) -> Result<DB, Error> {
+        let db = self.db_as_of(tx_key).await?.without_adjacency();
+        let (_, ref_attributes) = self.schema_maps().await;
+        Ok(self.attach_adjacency(db, ref_attributes, adjacency, algebra))
+    }
+
+    /// Latest DB with the adjacency and matrix-algebra toggles set explicitly.
+    pub(crate) async fn db_with_modes(&self, adjacency: bool, algebra: bool) -> Result<DB, Error> {
         let (ident_map, ref_attributes) = self.schema_maps().await;
         let handle = Handle::current();
         let range_stats = self.slate.range_stats.clone();
         let db = DB::from_latest_sdb(self.slate.db.clone(), ident_map, handle, range_stats)
             .await?
             .with_layout(self.layout);
-        Ok(self.attach_adjacency(db, ref_attributes, enabled))
+        Ok(self.attach_adjacency(db, ref_attributes, adjacency, algebra))
     }
 
     pub(crate) async fn register_incremental_query(
@@ -370,7 +406,8 @@ impl<L: TxLog> QueryNode for Node<L> {
     type DB = DB;
 
     async fn db(&self) -> Result<DB, Error> {
-        self.db_with_adjacency(adjacency_matrix_enabled()).await
+        self.db_with_modes(adjacency_matrix_enabled(), matrix_algebra_enabled())
+            .await
     }
 
     async fn db_as_of(&self, tx_key: TxKey) -> Result<DB, Error> {
