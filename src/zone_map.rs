@@ -266,7 +266,7 @@ impl Component {
         }
     }
 
-    fn extract<'a>(self, key: &'a [u8]) -> &'a [u8] {
+    fn extract(self, key: &[u8]) -> &[u8] {
         let end = key.len() - codec::TX_EID_OP_SUFFIX;
         match self {
             Self::AevValue => {
@@ -393,9 +393,12 @@ impl ZoneMap {
 // Cache: one map per (index, attribute), tagged with the basis it was built at
 // ---------------------------------------------------------------------------
 
+/// A cached map plus the basis it was built at.
+type CachedMap = (i64, Arc<ZoneMap>);
+
 #[derive(Default)]
 pub struct ZoneMapCache {
-    maps: Mutex<HashMap<(u8, i64), (i64, Arc<ZoneMap>)>>,
+    maps: Mutex<HashMap<(u8, i64), CachedMap>>,
 }
 
 impl std::fmt::Debug for ZoneMapCache {
@@ -432,9 +435,9 @@ impl ZoneMapCache {
 mod tests {
     use super::*;
     use crate::codec::Encode;
+    use crate::memory_log::MemoryLog;
     use crate::node::{Node, QueryNode, SubmitNode};
     use crate::ops::{DataType, TxOp};
-    use crate::memory_log::MemoryLog;
     use crate::schema::test_schema_tx;
     use edn::kw;
     use triplox_client::node::Database;
@@ -552,7 +555,7 @@ mod tests {
     }
 
     // The toggle is process-wide, so the on/off tests take turns.
-    static TOGGLE: Mutex<()> = Mutex::new(());
+    static TOGGLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     // Ages spread across 0..300 so a run's value range covers almost everything.
     fn scattered(index: i64) -> i64 {
@@ -589,7 +592,7 @@ mod tests {
         let mut early = None;
         for chunk in 0..4 {
             let ops = (0..150)
-                .map(|offset| {
+                .flat_map(|offset| {
                     let index = chunk * 150 + offset;
                     vec![
                         TxOp::Add {
@@ -604,7 +607,6 @@ mod tests {
                         },
                     ]
                 })
-                .flatten()
                 .collect::<Vec<_>>();
             let key = commit(&node, ops).await;
             if chunk == 1 {
@@ -630,7 +632,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn results_match_with_zone_maps_on_and_off() {
-        let _guard = TOGGLE.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = TOGGLE.lock().await;
         let previous = enabled();
 
         set_enabled(false);
@@ -666,7 +668,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn zone_map_prunes_and_counts_skips() {
-        let _guard = TOGGLE.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = TOGGLE.lock().await;
         let previous = enabled();
         set_enabled(true);
         // Ages that track insertion order, so a run's value range is narrow.

@@ -13,6 +13,9 @@ Per-run (RUN_SIZE keys in key order) min/max of the non-prefix component (V for 
 - `cargo test -p triplox --lib zone_map`: 8/8 pass, including
   `results_match_with_zone_maps_on_and_off` (10 queries x {latest, as-of} x {cold, warm cache})
   and `zone_map_prunes_and_counts_skips`.
+- `cargo test -p triplox`: 647 pass, 0 fail, both with the toggle off and with
+  TRIPLOX_ZONE_MAPS=1 forced on for the whole suite. `cargo clippy --workspace --all-targets`:
+  clean. `cargo fmt` applied.
 - KEY LIMITATION found: run pruning only fires when values correlate with key order. With
   values scattered across the whole domain every run spans the whole range and nothing prunes.
   The bench's `:g/weight = i % 1000` does correlate with entity id, so it prunes.
@@ -23,9 +26,8 @@ mid-link when it is low; just retry. I deleted only this worktree's `target/rele
 `target/tmp/retry_tests.sh <log> <cmd...>` waits for headroom and retries on ENOSPC.
 
 ## Next
-1. `cargo test -p triplox` (full), `cargo clippy -p triplox --all-targets`.
-2. A/B interleaved bench, 3 runs each, ASOF=1; write the two JSON files.
-3. EXPERIMENT.md, `cargo fmt`, commit.
+1. A/B interleaved bench, 3 runs each, ASOF=1; write the two JSON files.
+2. EXPERIMENT.md, `cargo fmt`, commit.
 
 ## Shared context
 
