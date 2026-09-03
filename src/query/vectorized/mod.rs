@@ -29,6 +29,16 @@ pub(crate) trait BatchPattern: Send + Sync {
 
     // Row indices of `batch` that satisfy this pattern, ascending.
     fn validate_batch(&self, batch: &Batch) -> Result<Vec<u32>>;
+
+    // Columnar counterpart of `ExecPattern::candidate_sets`: sorted entity-id candidates per row
+    // of `batch`, when they are available without IO.
+    fn candidate_sets_batch<'a>(
+        &'a self,
+        _batch: &Batch,
+        _added: &[Variable],
+    ) -> Result<Option<Vec<&'a [i64]>>> {
+        Ok(None)
+    }
 }
 
 // Row indices of `len` rows ordered by `compare`, which is a total order over row indices.

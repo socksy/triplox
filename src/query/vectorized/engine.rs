@@ -5,6 +5,7 @@ use anyhow::{ensure, Context, Result};
 
 use super::batch::Batch;
 use super::BatchPattern;
+use crate::query::adjacency::{encode_entity, intersect_sorted};
 use crate::query::binding_bag::BindingBag;
 use crate::query::exec_pattern::{PatternId, Proposal};
 use crate::query::stage::Stage;
@@ -68,7 +69,47 @@ impl BatchedJoinEngine {
         Self::validate_all(Arc::new(reordered), validators)
     }
 
+    // Columnar counterpart of `GenericJoinEngine::execute_intersecting_stage`: intersects the
+    // candidate sets of the proposers that can supply one and demotes the rest to validators.
+    fn execute_intersecting_stage(stage: &Stage, input: &Arc<Batch>) -> Result<Option<Arc<Batch>>> {
+        let mut per_proposer = Vec::with_capacity(stage.proposers().len());
+        let mut suppliers = Vec::new();
+        for proposer in stage.proposers() {
+            if let Some(sets) =
+                Self::batch_pattern(proposer.as_ref()).candidate_sets_batch(input, stage.added())?
+            {
+                per_proposer.push(sets);
+                suppliers.push(proposer.id());
+            }
+        }
+        if per_proposer.is_empty() {
+            return Ok(None);
+        }
+        let mut parent_rows = Vec::new();
+        let mut values = Vec::new();
+        for row in 0..input.len() {
+            let sets: Vec<&[i64]> = per_proposer.iter().map(|sets| sets[row]).collect();
+            for id in intersect_sorted(&sets) {
+                parent_rows.push(row as u32);
+                values.push(encode_entity(id));
+            }
+        }
+        let extended = input.extend(parent_rows, stage.added()[0].clone(), values)?;
+        let reordered = Arc::new(extended.reorder(stage.target_variables())?);
+        let validators = stage
+            .participants()
+            .iter()
+            .filter(|participant| !suppliers.contains(&participant.id()))
+            .map(|participant| participant.as_ref());
+        Self::validate_all(reordered, validators).map(Some)
+    }
+
     fn execute_proposing_stage(stage: &Stage, input: &Arc<Batch>) -> Result<Arc<Batch>> {
+        if stage.proposers().len() > 1 && stage.added().len() == 1 {
+            if let Some(result) = Self::execute_intersecting_stage(stage, input)? {
+                return Ok(result);
+            }
+        }
         if stage.proposers().len() == 1 {
             let proposer = stage
                 .proposers()

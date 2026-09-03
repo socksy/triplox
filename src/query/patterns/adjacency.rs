@@ -395,6 +395,32 @@ impl BatchPattern for AdjacencyPattern {
         Ok((parent_rows, values))
     }
 
+    fn candidate_sets_batch<'a>(
+        &'a self,
+        batch: &Batch,
+        added: &[Variable],
+    ) -> Result<Option<Vec<&'a [i64]>>> {
+        let position = self.batch_proposed_position(batch, added)?;
+        // With the other side unbound every row's candidate set is the whole key list, which is
+        // no more selective than what another proposer offers, so let the engine choose instead.
+        if let TripleTerm::Variable(other) = self.other_term(position) {
+            if !batch.contains(other) {
+                return Ok(None);
+            }
+        }
+        let csr = self.csr_for(position);
+        let sets = self
+            .batch_row_keys(batch, position)?
+            .into_iter()
+            .map(|key| match key {
+                RowKey::Key(key) => csr.row(key),
+                RowKey::All => self.keys_for(position).keys(),
+                RowKey::Missing => &[][..],
+            })
+            .collect();
+        Ok(Some(sets))
+    }
+
     fn validate_batch(&self, batch: &Batch) -> Result<Vec<u32>> {
         let bound = |term: &TripleTerm| match term {
             TripleTerm::Variable(variable) => batch
