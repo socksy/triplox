@@ -7,29 +7,31 @@ Resolve conflicts so that BOTH features work and both toggles remain independent
 Each source branch has an EXPERIMENT.md (design, toggle env var names, hook points, known regressions) and an equivalence test. Read them before merging. Keep their EXPERIMENT.md/PROGRESS.md content by moving each to docs/<branch>-EXPERIMENT.md so the merge conflict on those two files is trivial; this worktree's own PROGRESS.md (this file) and COMBINED.md are the live documents.
 
 ## Status
-- All three merged, `cargo check --all-targets` clean. Conflicts: PROGRESS.md (all three), src/query/patterns/triple.rs (import block, columnar), src/db_value.rs + src/node.rs (DB/Node gain both `layout` and `adjacency*` fields).
-- Fixed a real cross-experiment bug: `AdjMatrix::build` scanned AEV with a raw `TemporalFilterIterator`, which under columnar reads segment headers instead of datoms. It now picks `SegmentIterator` when the layout is columnar. Proven: reverting the fix makes `adjacency_path_matches_iterator_path` fail with wrong (not erroring) results under columnar+adj.
-- Added `TRIPLOX_ENGINE_LOG=1` at the `execute_query` fork and a `--query <name>` stderr marker in the bench, so the engine actually chosen is observable per query.
-- Test status (`cargo test -p triplox`):
-  - off: 619 lib + 23 + 3 + 6, all green.
-  - TRIPLOX_BATCHED_JOIN=1 alone: all green.
-  - TRIPLOX_ADJ_MATRIX=1 alone: all green.
-  - TRIPLOX_SEGMENT_LAYOUT=columnar alone: 608 passed / 11 failed.
-  - all three on: same 608 / 11, no extra failures from combining.
-  - The 11 are columnar's documented 10 plus `query::vectorized::tests::batched_engine_matches_the_row_engine`, which is the same harness artifact: the test writes raw AEV/AVE/AE/AV row keys with `slate.put` and then reads through the query engine, which in columnar mode reports "bad segment header". So the batched-vs-row equivalence test cannot run under the columnar layout; bench row counts are the substitute check there.
+DONE. All three branches merged on exp/combo-full, three composition fixes made, three interleaved
+bench sweeps run, COMBINED.md written. See COMBINED.md for the full write-up.
 
-- `cargo clippy -p triplox --all-targets`: clean with toggles off and with all three on.
-
-- Engine probe (`scratchpad/probe.sh`, VERTICES=500 RUNS=1, logs/probe-*.err) confirms the predicted interaction. With `TRIPLOX_ADJ_MATRIX=1` the batched engine is rejected for every query that touches the ref attribute `:g/to`: triangles, two_hop_count, three_hop_count, out_degree, in_degree_top, neighbors_of_42, heavy_neighbors all run `engine=row batched_toggle=true supported=false`. Only weight_filter, weight_sum and label_lookup stay batched, and those are exactly the queries batching helps least. Columnar does not change engine selection either way.
-
-- Interleaved bench done (5 arms x 3 passes, 5 timed runs/query/pass, VERTICES=2000 EDGE_PROB=0.01, 39764 edges). JSON in scratchpad/results/combo-full-{off,batched,columnar,adj,all}.json. Row counts identical in all five arms and equal to the hand-off baseline.
-- Headline: three_hop_count is 3.86x faster with batching alone but only 1.75x with everything on, because the adjacency pattern disables batching. triangles/out_degree/neighbors_of_42 are all-adjacency wins that columnar and batching add nothing to. weight_filter/weight_sum are the only queries where two toggles multiply (columnar 2.7x x batched -> 5.5x), and they are the only ref-free multi-stage queries left on the batched engine.
+Summary:
+- Merge conflicts: PROGRESS.md (all three), src/query/patterns/triple.rs (imports only),
+  src/db_value.rs and src/node.rs (DB/Node take both `layout` and `adjacency*`). Source branch
+  docs moved to docs/<branch>-EXPERIMENT.md and docs/<branch>-PROGRESS.md.
+- Three interactions found and fixed:
+  1. `AdjMatrix::build` scanned AEV with a raw iterator; under columnar it read segment headers and
+     built a wrong matrix, silently. Now picks `SegmentIterator` when the layout is columnar.
+  2. `AdjacencyPattern` had no `BatchPattern`, so `TRIPLOX_ADJ_MATRIX=1` silently disabled the
+     batched engine for all 7 ref-attribute queries (confirmed with `TRIPLOX_ENGINE_LOG=1`).
+     Implemented `BatchPattern for AdjacencyPattern`.
+  3. That alone regressed heavy_neighbors to 0.62x, because `execute_intersecting_stage` existed
+     only in the row engine. Ported it to `BatchedJoinEngine` with a new
+     `BatchPattern::candidate_sets_batch`.
+- Bench: composed stack is the fastest arm on all ten queries; 3.4x-47x on the eight that carry
+  signal; row counts identical everywhere and equal to the baseline.
+  JSON: scratchpad/results/combo-full-{off,batched,columnar,adj,all,adj-composed,all-composed}.json
+- Tests: green in every configuration except any that includes columnar, where 11 fail (columnar's
+  documented 10 plus `query::vectorized::tests::batched_engine_matches_the_row_engine`, the same
+  raw-row-key harness artifact). Clippy clean off and all-on. `cargo fmt` applied.
 
 ## Next
-1. Sixth arm: `BatchPattern for AdjacencyPattern` so the matrices and the batched engine actually compose; re-measure.
-2. COMBINED.md.
-3. Interleaved bench (off / batched / columnar / adj / all, 3 passes) via scratchpad/bench.sh.
-4. COMBINED.md.
+Nothing outstanding for this experiment. Follow-ups are listed at the end of COMBINED.md.
 
 ## Shared context
 
