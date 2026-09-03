@@ -18,9 +18,10 @@ Each source branch has an EXPERIMENT.md (design, toggle env var names, hook poin
   - all three on: same 608 / 11, no extra failures from combining.
   - The 11 are columnar's documented 10 plus `query::vectorized::tests::batched_engine_matches_the_row_engine`, which is the same harness artifact: the test writes raw AEV/AVE/AE/AV row keys with `slate.put` and then reads through the query engine, which in columnar mode reports "bad segment header". So the batched-vs-row equivalence test cannot run under the columnar layout; bench row counts are the substitute check there.
 
+- `cargo clippy -p triplox --all-targets`: clean with toggles off and with all three on.
+
 ## Next
-1. clippy in every configuration.
-2. `TRIPLOX_ENGINE_LOG` probe run: which engine ran per query, per configuration.
+1. `TRIPLOX_ENGINE_LOG` probe run (scratchpad/probe.sh): which engine ran per query, per configuration. Blocked on the release bench build, which is slow on this shared machine.
 3. Interleaved bench (off / batched / columnar / adj / all, 3 passes) via scratchpad/bench.sh.
 4. COMBINED.md.
 
