@@ -22,9 +22,12 @@ Each source branch has an EXPERIMENT.md (design, toggle env var names, hook poin
 
 - Engine probe (`scratchpad/probe.sh`, VERTICES=500 RUNS=1, logs/probe-*.err) confirms the predicted interaction. With `TRIPLOX_ADJ_MATRIX=1` the batched engine is rejected for every query that touches the ref attribute `:g/to`: triangles, two_hop_count, three_hop_count, out_degree, in_degree_top, neighbors_of_42, heavy_neighbors all run `engine=row batched_toggle=true supported=false`. Only weight_filter, weight_sum and label_lookup stay batched, and those are exactly the queries batching helps least. Columnar does not change engine selection either way.
 
+- Interleaved bench done (5 arms x 3 passes, 5 timed runs/query/pass, VERTICES=2000 EDGE_PROB=0.01, 39764 edges). JSON in scratchpad/results/combo-full-{off,batched,columnar,adj,all}.json. Row counts identical in all five arms and equal to the hand-off baseline.
+- Headline: three_hop_count is 3.86x faster with batching alone but only 1.75x with everything on, because the adjacency pattern disables batching. triangles/out_degree/neighbors_of_42 are all-adjacency wins that columnar and batching add nothing to. weight_filter/weight_sum are the only queries where two toggles multiply (columnar 2.7x x batched -> 5.5x), and they are the only ref-free multi-stage queries left on the batched engine.
+
 ## Next
-1. Interleaved bench sweep (scratchpad/bench.sh, off/batched/columnar/adj/all x 3 passes).
-2. Consider a sixth arm: `BatchPattern for AdjacencyPattern` so the two actually compose.
+1. Sixth arm: `BatchPattern for AdjacencyPattern` so the matrices and the batched engine actually compose; re-measure.
+2. COMBINED.md.
 3. Interleaved bench (off / batched / columnar / adj / all, 3 passes) via scratchpad/bench.sh.
 4. COMBINED.md.
 
