@@ -20,8 +20,11 @@ Each source branch has an EXPERIMENT.md (design, toggle env var names, hook poin
 
 - `cargo clippy -p triplox --all-targets`: clean with toggles off and with all three on.
 
+- Engine probe (`scratchpad/probe.sh`, VERTICES=500 RUNS=1, logs/probe-*.err) confirms the predicted interaction. With `TRIPLOX_ADJ_MATRIX=1` the batched engine is rejected for every query that touches the ref attribute `:g/to`: triangles, two_hop_count, three_hop_count, out_degree, in_degree_top, neighbors_of_42, heavy_neighbors all run `engine=row batched_toggle=true supported=false`. Only weight_filter, weight_sum and label_lookup stay batched, and those are exactly the queries batching helps least. Columnar does not change engine selection either way.
+
 ## Next
-1. `TRIPLOX_ENGINE_LOG` probe run (scratchpad/probe.sh): which engine ran per query, per configuration. Blocked on the release bench build, which is slow on this shared machine.
+1. Interleaved bench sweep (scratchpad/bench.sh, off/batched/columnar/adj/all x 3 passes).
+2. Consider a sixth arm: `BatchPattern for AdjacencyPattern` so the two actually compose.
 3. Interleaved bench (off / batched / columnar / adj / all, 3 passes) via scratchpad/bench.sh.
 4. COMBINED.md.
 
