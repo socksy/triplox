@@ -9,6 +9,7 @@ use tokio::runtime::Handle;
 use crate::codec;
 use crate::slate::DEFAULT_SCAN_OPTIONS;
 use crate::util::next_prefix;
+use crate::zone_map::ZoneMap;
 
 use super::slate_iterator::{Extractor, Index};
 
@@ -33,6 +34,7 @@ where
     extractor: Extractor,
     as_of_encoded: [u8; 8],
     range_stats: Arc<slatedb_estimates::RangeStats<M>>,
+    zone_map: Option<Arc<ZoneMap>>,
 }
 
 /// Extract the logical key from a full key (everything except timestamp + op suffix).
@@ -56,6 +58,22 @@ where
     where
         D: DbReadOps + Send + Sync,
     {
+        Self::new_with_zone_map(prefix, slate, handle, extractor, as_of, range_stats, None)
+    }
+
+    /// Like `new`, but consults `zone_map` to jump over runs entirely newer than `as_of`.
+    pub fn new_with_zone_map<D>(
+        prefix: &[u8],
+        slate: &D,
+        handle: Handle,
+        extractor: Extractor,
+        as_of: i64,
+        range_stats: Arc<slatedb_estimates::RangeStats<M>>,
+        zone_map: Option<Arc<ZoneMap>>,
+    ) -> Result<Self, Error>
+    where
+        D: DbReadOps + Send + Sync,
+    {
         let prefix_bytes = Bytes::from(prefix.to_vec());
         let as_of_encoded = codec::encode_i64_bytes(as_of);
         let iterator =
@@ -69,6 +87,7 @@ where
             extractor,
             as_of_encoded,
             range_stats,
+            zone_map,
         };
 
         // Advance to the first valid entry
@@ -122,7 +141,21 @@ where
                         self.current_key = Some(key);
                         return Ok(());
                     }
-                    // Entry is newer than as_of — skip it, keep scanning.
+                    // Entry is newer than as_of — skip it, keep scanning. When the zone map
+                    // says the whole run is newer, jump to the next run instead.
+                    if let Some(end) = self
+                        .zone_map
+                        .as_ref()
+                        .and_then(|zm| zm.newer_run_end(&key, &self.as_of_encoded))
+                    {
+                        if end.starts_with(&self.prefix) {
+                            self.handle.block_on(self.inner.seek(end.clone()))?;
+                        } else {
+                            // The run extends past this scan's prefix: nothing visible remains.
+                            self.current_key = None;
+                            return Ok(());
+                        }
+                    }
                 }
             }
         }

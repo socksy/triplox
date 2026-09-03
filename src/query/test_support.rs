@@ -23,5 +23,6 @@ pub(crate) fn db_at_tx_id(
             system_time: st_from_unix_epoch(0),
         },
         Arc::clone(&components.range_stats),
+        Arc::clone(&components.zone_maps),
     ))
 }

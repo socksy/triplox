@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::util::random_string;
+use crate::zone_map::ZoneMapCache;
 
 pub const DEFAULT_BLOCK_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_META_CACHE_BYTES: u64 = 512 * 1024 * 1024;
@@ -55,6 +56,7 @@ pub struct SlateComponents {
     pub object_path: String,
     pub object_store: Arc<dyn ObjectStore>,
     pub range_stats: Arc<slatedb_estimates::RangeStats>,
+    pub zone_maps: Arc<ZoneMapCache>,
 }
 
 impl std::fmt::Debug for SlateComponents {
@@ -87,6 +89,7 @@ pub async fn in_memory_slate() -> SlateComponents {
         object_path: path,
         object_store,
         range_stats,
+        zone_maps: Arc::new(ZoneMapCache::default()),
     }
 }
 
@@ -116,6 +119,7 @@ pub async fn local_slate(root_path: &Path) -> SlateComponents {
         object_path: slate_path,
         object_store,
         range_stats,
+        zone_maps: Arc::new(ZoneMapCache::default()),
     }
 }
 
@@ -174,6 +178,7 @@ pub async fn remote_slate(
         object_path: path,
         object_store,
         range_stats,
+        zone_maps: Arc::new(ZoneMapCache::default()),
     })
 }
 

@@ -1863,6 +1863,7 @@ mod tests {
             tokio::runtime::Handle::current(),
             tx1,
             Arc::clone(&components.range_stats),
+            Arc::clone(&components.zone_maps),
         ));
         let rows = tokio::task::spawn_blocking(move || execute_query(&query, &[], db)).await??;
 

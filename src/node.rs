@@ -283,6 +283,7 @@ impl<L: TxLog> Node<L> {
             handle,
             tx_key,
             range_stats,
+            self.slate.zone_maps.clone(),
         )
         .with_layout(self.layout);
         Ok(self.attach_adjacency(
@@ -343,9 +344,15 @@ impl<L: TxLog> Node<L> {
         let (ident_map, ref_attributes) = self.schema_maps().await;
         let handle = Handle::current();
         let range_stats = self.slate.range_stats.clone();
-        let db = DB::from_latest_sdb(self.slate.db.clone(), ident_map, handle, range_stats)
-            .await?
-            .with_layout(self.layout);
+        let db = DB::from_latest_sdb(
+            self.slate.db.clone(),
+            ident_map,
+            handle,
+            range_stats,
+            self.slate.zone_maps.clone(),
+        )
+        .await?
+        .with_layout(self.layout);
         Ok(self.attach_adjacency(db, ref_attributes, adjacency, algebra))
     }
 

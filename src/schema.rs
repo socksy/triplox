@@ -855,6 +855,7 @@ pub(crate) async fn load_schema_from_indices(slate: &crate::slate::SlateComponen
         Handle::current(),
         *SCHEMA_LOAD_TX_KEY,
         Arc::clone(&slate.range_stats),
+        Arc::clone(&slate.zone_maps),
     ));
 
     let ident_query: ParsedQuery = "[:find ?e ?ident :where [?e :db/ident ?ident]]"
