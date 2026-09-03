@@ -4,12 +4,15 @@
 use std::sync::Arc;
 
 use anyhow::{ensure, Result};
+use bytes::Bytes;
 use edn::query::Variable;
 
 use crate::query::adjacency::{decode_entity, AdjMatrix, Csr};
 use crate::query::binding_bag::{BindingBag, BindingRow};
 use crate::query::exec_pattern::{ExecPattern, PatternId, Proposal};
 use crate::query::patterns::triple::TripleTerm;
+use crate::query::vectorized::batch::{Batch, ColumnView};
+use crate::query::vectorized::BatchPattern;
 
 #[derive(Clone, Copy)]
 enum Position {
@@ -164,6 +167,44 @@ impl AdjacencyPattern {
         input.extend_rows(added.to_vec(), extensions)
     }
 
+    /// `row_keys` over a columnar batch.
+    fn batch_row_keys(&self, batch: &Batch, position: Position) -> Result<Vec<RowKey>> {
+        Ok(match self.other_term(position) {
+            TripleTerm::Variable(other) if batch.contains(other) => {
+                let view = batch.view_of(other)?;
+                (0..batch.len())
+                    .map(|row| decode_entity(view.get(row)).map_or(RowKey::Missing, RowKey::Key))
+                    .collect()
+            }
+            TripleTerm::Variable(_) => vec![RowKey::All; batch.len()],
+            TripleTerm::Constant(constant) => {
+                let key = decode_entity(constant).map_or(RowKey::Missing, RowKey::Key);
+                vec![key; batch.len()]
+            }
+        })
+    }
+
+    fn batch_proposed_position(&self, batch: &Batch, added: &[Variable]) -> Result<Position> {
+        ensure!(
+            added.len() == 1,
+            "Triple pattern {} can propose exactly one variable, got {added:?}",
+            self.id
+        );
+        ensure!(
+            !batch.contains(&added[0]),
+            "Triple pattern {} cannot add already-bound variable {}",
+            self.id,
+            added[0]
+        );
+        self.position_for_variable(&added[0]).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Triple pattern {} cannot propose variable {}",
+                self.id,
+                added[0]
+            )
+        })
+    }
+
     fn proposed_position(&self, input: &BindingBag, added: &[Variable]) -> Result<Position> {
         ensure!(
             added.len() == 1,
@@ -272,6 +313,10 @@ impl ExecPattern for AdjacencyPattern {
         Ok(Some(sets))
     }
 
+    fn as_batch(&self) -> Option<&dyn BatchPattern> {
+        Some(self)
+    }
+
     fn join(
         &self,
         input: &BindingBag,
@@ -289,6 +334,117 @@ impl ExecPattern for AdjacencyPattern {
             Ok(res)
         } else {
             self.propose(input, added)?.reorder(target_variables)
+        }
+    }
+}
+
+impl BatchPattern for AdjacencyPattern {
+    fn count_batch(
+        &self,
+        batch: &Batch,
+        added: &[Variable],
+        proposals: &mut [Proposal],
+    ) -> Result<()> {
+        ensure!(
+            proposals.len() == batch.len(),
+            "Triple pattern {} received {} proposals for {} input rows",
+            self.id,
+            proposals.len(),
+            batch.len()
+        );
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let position = self.batch_proposed_position(batch, added)?;
+        let csr = self.csr_for(position);
+        for (key, proposal) in self
+            .batch_row_keys(batch, position)?
+            .into_iter()
+            .zip(proposals)
+        {
+            let count = match key {
+                RowKey::Key(key) => csr.nnz(key),
+                RowKey::All => self.keys_for(position).keys().len(),
+                RowKey::Missing => 0,
+            };
+            proposal.consider(self.id, count);
+        }
+        Ok(())
+    }
+
+    fn propose_batch(&self, batch: &Batch, added: &[Variable]) -> Result<(Vec<u32>, Vec<Bytes>)> {
+        let position = self.batch_proposed_position(batch, added)?;
+        let csr = self.csr_for(position);
+        let mut parent_rows = Vec::new();
+        let mut values = Vec::new();
+        for (row, key) in self
+            .batch_row_keys(batch, position)?
+            .into_iter()
+            .enumerate()
+        {
+            let extensions = match key {
+                RowKey::Key(key) => csr.row_encoded(key),
+                RowKey::All => self.keys_for(position).keys_encoded(),
+                RowKey::Missing => Vec::new(),
+            };
+            for value in extensions {
+                parent_rows.push(row as u32);
+                values.push(value);
+            }
+        }
+        Ok((parent_rows, values))
+    }
+
+    fn validate_batch(&self, batch: &Batch) -> Result<Vec<u32>> {
+        let bound = |term: &TripleTerm| match term {
+            TripleTerm::Variable(variable) => batch
+                .contains(variable)
+                .then(|| batch.view_of(variable))
+                .transpose()
+                .map(|view| view.map(BatchBound::Column)),
+            TripleTerm::Constant(constant) => {
+                Ok(Some(BatchBound::Constant(decode_entity(constant))))
+            }
+        };
+        let (entity, value) = (bound(&self.entity)?, bound(&self.value)?);
+        ensure!(
+            entity.is_some() || value.is_some(),
+            "Triple pattern {} has no bound variables to validate",
+            self.id
+        );
+        let mut kept = Vec::new();
+        for row in 0..batch.len() {
+            let ok = match (&entity, &value) {
+                (Some(entity), Some(value)) => match (entity.resolve(row), value.resolve(row)) {
+                    (Some(entity), Some(value)) => self.matrix.out.contains(entity, value),
+                    _ => false,
+                },
+                (Some(entity), None) => entity
+                    .resolve(row)
+                    .is_some_and(|e| self.matrix.out.has_key(e)),
+                (None, Some(value)) => value
+                    .resolve(row)
+                    .is_some_and(|v| self.matrix.inn.has_key(v)),
+                (None, None) => unreachable!(),
+            };
+            if ok {
+                kept.push(row as u32);
+            }
+        }
+        Ok(kept)
+    }
+}
+
+enum BatchBound {
+    Column(ColumnView),
+    Constant(Option<i64>),
+}
+
+impl BatchBound {
+    fn resolve(&self, row: usize) -> Option<i64> {
+        match self {
+            Self::Column(view) => decode_entity(view.get(row)),
+            Self::Constant(id) => *id,
         }
     }
 }
