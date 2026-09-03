@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use edn::query::Variable;
 
 use super::binding_bag::BindingBag;
+use super::vectorized::BatchPattern;
 
 pub(crate) type PatternId = usize;
 
@@ -65,6 +66,12 @@ pub(crate) trait ExecPattern: Send + Sync {
         added: &[Variable],
         target_variables: &[Variable],
     ) -> Result<BindingBag>;
+
+    // Columnar implementation of this pattern, when it has one. `BatchedJoinEngine` runs a query
+    // only if every participant answers `Some`.
+    fn as_batch(&self) -> Option<&dyn BatchPattern> {
+        None
+    }
 }
 
 #[cfg(test)]

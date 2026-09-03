@@ -4,7 +4,8 @@
 //!
 //! Run: `cargo bench --bench datalog_bench`
 //! Env: VERTICES (default 2000), EDGE_PROB (default 0.01), RUNS (default 5),
-//!      BENCH_OUT (optional path for JSON results).
+//!      BENCH_OUT (optional path for JSON results),
+//!      QUERY_FILTER (optional comma-separated query names to run).
 
 use std::time::Instant;
 
@@ -182,7 +183,16 @@ async fn main() {
 
     let db = node.db().await.expect("db");
     let mut json = Vec::new();
+    let filter: Option<Vec<String>> = std::env::var("QUERY_FILTER")
+        .ok()
+        .map(|v| v.split(',').map(str::to_string).collect());
     for (name, q) in QUERIES {
+        if filter
+            .as_ref()
+            .is_some_and(|f| !f.iter().any(|n| n == name))
+        {
+            continue;
+        }
         let mut times = Vec::with_capacity(runs);
         let mut rows = 0;
         for _ in 0..runs {

@@ -6,6 +6,7 @@ pub(crate) mod exec_pattern;
 pub(crate) mod patterns;
 pub(crate) mod plan;
 pub(crate) mod stage;
+pub(crate) mod vectorized;
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -32,6 +33,7 @@ use crate::ops::{DataType, QueryArg};
 use crate::query::binding_bag::{BindingBag, BindingRow};
 use crate::query::engine::GenericJoinEngine;
 use crate::query::plan::build_logical_plan;
+use crate::query::vectorized::engine::BatchedJoinEngine;
 use crate::query_validation::validate_query;
 use regex::Regex;
 
@@ -729,6 +731,11 @@ fn resolve_limit(limit: &Limit, in_bindings: &[Binding], args: &[QueryArg]) -> L
     }
 }
 
+/// Opt-in columnar execution. Anything the batched engine does not cover falls back silently.
+fn batched_join_enabled() -> bool {
+    std::env::var("TRIPLOX_BATCHED_JOIN").is_ok_and(|value| value != "0" && !value.is_empty())
+}
+
 /// Execute a query against the database.
 pub fn execute_query<D, M>(
     query: &ParsedQuery,
@@ -743,7 +750,11 @@ where
     let logical_plan = build_logical_plan(query, args)?;
     let output_variables = logical_plan.output_variables().to_vec();
     let stages = logical_plan.materialize(db, None)?;
-    let bindings = GenericJoinEngine::execute(&stages, BindingBag::unit())?;
+    let bindings = if batched_join_enabled() && BatchedJoinEngine::supports(&stages) {
+        BatchedJoinEngine::execute(&stages)?
+    } else {
+        GenericJoinEngine::execute(&stages, BindingBag::unit())?
+    };
     ensure!(
         bindings.variables == output_variables,
         "Query execution produced variables {:?}, expected {:?}",
