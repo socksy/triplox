@@ -118,6 +118,18 @@ const QUERIES: &[(&str, &str)] = &[
         "label_lookup",
         "[:find ?e :where [?e :g/label \"label-777\"]]",
     ),
+    (
+        "three_hop_count_distinct",
+        "[:find (count-distinct ?d) :where [?a :g/to ?b] [?b :g/to ?c] [?c :g/to ?d]]",
+    ),
+    (
+        "two_hop_from_42",
+        "[:find (count ?c) :where [?a :g/id 42] [?a :g/to ?b] [?b :g/to ?c]]",
+    ),
+    (
+        "triangle_count",
+        "[:find (count ?a) :where [?a :g/to ?b] [?b :g/to ?c] [?a :g/to ?c]]",
+    ),
 ];
 
 #[tokio::main(flavor = "multi_thread")]

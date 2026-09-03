@@ -16,6 +16,7 @@ use crate::index::IndexType;
 use crate::iterator::slate_iterator::{Extractor, Index};
 use crate::iterator::temporal_filter_iterator::TemporalFilterIterator;
 use crate::ops::DataType;
+use crate::query::bitset::{BitMatrix, BitMatrixCell};
 
 pub(crate) fn encode_entity(id: i64) -> Bytes {
     let mut buf = Vec::with_capacity(codec::ENTITY_LENGTH);
@@ -136,9 +137,22 @@ pub(crate) struct AdjMatrix {
     pub(crate) inn: Csr,
     pub(crate) nnz: usize,
     pub(crate) build_time: std::time::Duration,
+    out_bits: BitMatrixCell,
+    inn_bits: BitMatrixCell,
 }
 
 impl AdjMatrix {
+    /// Dense boolean form of one orientation, over the node space shared by both. None when
+    /// the graph is too large for a dense matrix, in which case callers use the CSR instead.
+    pub(crate) fn bits(&self, backwards: bool) -> Option<&BitMatrix> {
+        let (cell, rows, other) = if backwards {
+            (&self.inn_bits, &self.inn, &self.out)
+        } else {
+            (&self.out_bits, &self.out, &self.inn)
+        };
+        cell.get_or_init(|| BitMatrix::build(rows, other.keys()))
+    }
+
     pub(crate) fn bytes(&self) -> usize {
         self.out.bytes() + self.inn.bytes()
     }
@@ -190,6 +204,8 @@ impl AdjMatrix {
             inn,
             nnz: pairs.len(),
             build_time: start.elapsed(),
+            out_bits: BitMatrixCell::default(),
+            inn_bits: BitMatrixCell::default(),
         })
     }
 }

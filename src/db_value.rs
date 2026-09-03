@@ -30,6 +30,8 @@ where
 pub(crate) struct Adjacency {
     cache: Arc<AdjacencyCache>,
     ref_attributes: Arc<std::collections::HashSet<i64>>,
+    // Answer the aggregate query shapes in query::algebra from the matrices directly.
+    matrix_algebra: bool,
 }
 
 impl<D, M> Clone for DB<D, M>
@@ -81,8 +83,23 @@ where
         self.adjacency = Some(Adjacency {
             cache,
             ref_attributes: Arc::new(ref_attributes),
+            matrix_algebra: false,
         });
         self
+    }
+
+    /// Requires adjacency matrices; a no-op when they are not attached.
+    pub(crate) fn with_matrix_algebra(mut self, enabled: bool) -> Self {
+        if let Some(adjacency) = self.adjacency.as_mut() {
+            adjacency.matrix_algebra = enabled;
+        }
+        self
+    }
+
+    pub(crate) fn matrix_algebra(&self) -> bool {
+        self.adjacency
+            .as_ref()
+            .is_some_and(|adjacency| adjacency.matrix_algebra)
     }
 
     pub(crate) fn without_adjacency(mut self) -> Self {

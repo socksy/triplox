@@ -1,7 +1,9 @@
 #![allow(unused)]
 
 pub(crate) mod adjacency;
+pub(crate) mod algebra;
 pub(crate) mod binding_bag;
+pub(crate) mod bitset;
 pub(crate) mod engine;
 pub(crate) mod exec_pattern;
 pub(crate) mod patterns;
@@ -741,6 +743,9 @@ where
     M: DbMetadataOps + Send + Sync + 'static,
 {
     validate_query(query, args)?;
+    if let Some(result) = algebra::try_execute(query, args, &db)? {
+        return Ok(result);
+    }
     let logical_plan = build_logical_plan(query, args)?;
     let output_variables = logical_plan.output_variables().to_vec();
     let stages = logical_plan.materialize(db, None)?;

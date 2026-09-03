@@ -1,5 +1,10 @@
 # Experiment: sparse adjacency matrices for ref attributes
 
+> **Follow-on experiment: matrix algebra (`TRIPLOX_MATRIX_ALGEBRA=1`).** See the
+> "Matrix algebra" section at the end of this file. The original CSR/AdjacencyPattern
+> experiment below is unchanged and still the default when only `TRIPLOX_ADJ_MATRIX=1`
+> is set.
+
 ## Goal
 RedisGraph/GraphBLAS-style: per (ref attribute, basis) build CSR adjacency from one AEV scan, cache on the node, and serve `[?x :ref ?y]` triple patterns from it (row lookups for hops, intersections for triangle closing edge, row nnz for degree) instead of SlateDB iterators. Toggle: env var (check src/query/adjacency.rs for the name actually used). Time-travel queries may fall back.
 
@@ -42,3 +47,42 @@ Definition of done:
 ## Progress protocol
 
 After every milestone (compiles, test passes, bench run, doc written): update the Status and Next sections below, then `git add -A && git commit -q -m "wip(sparse-matrix): <milestone>"`. Commit even if incomplete. This file is the hand-off; a fresh agent must be able to continue from it alone.
+
+
+# Experiment 2: matrix algebra over the CSR matrices
+
+## Goal
+Evaluate aggregate-only chain and triangle queries as sparse matrix algebra instead of
+enumerating join tuples. Second toggle `TRIPLOX_MATRIX_ALGEBRA=1`, which needs
+`TRIPLOX_ADJ_MATRIX=1` to supply the matrices. Everything else falls back unchanged.
+
+## Status
+- New: `src/query/algebra.rs` (shape recognition + evaluation), `src/query/bitset.rs`
+  (dense boolean rows and hand-written aarch64 NEON AND/OR/popcount kernels).
+- Modified: `src/query.rs` (`execute_query` tries `algebra::try_execute` first, plus the
+  two new module declarations), `src/query/adjacency.rs` (`AdjMatrix::bits`, lazily built
+  dense form per orientation), `src/db_value.rs` (`matrix_algebra` flag on the DB value),
+  `src/node.rs` (`matrix_algebra_enabled`, `db_with_modes`, `db_as_of_with_modes`).
+- Shapes handled: k-hop chains `[?x0 :a ?x1] .. [?x(k-1) :a ?xk]` with `(count ?xi)` or
+  `(count-distinct ?x0 | ?xk)`, optionally anchored by clauses that mention exactly one
+  endpoint and nothing else; and triangles `[?a :a ?b] [?b :a ?c] [?a :a ?c]` with
+  `(count ?v)` for any of the three variables.
+- Semirings: integer (path counts, `1^T A^k 1`) for `count`; boolean for
+  `count-distinct`, run as bitset OR/AND + popcount when every hop shares one attribute.
+- NEON: `or_into`, `and_popcount`, `popcount` in `src/query/bitset.rs` use
+  `vorrq_u64` / `vandq_u64` / `vcntq_u8` / `vaddvq_u8`, 128 bits per step, with a scalar
+  fallback for other architectures. Dense rows are capped at 64 MB, above which the
+  sorted-merge CSR path is used instead.
+- Equivalence tests pass: `query::algebra::tests::algebra_path_matches_generic_join`
+  (3 random graphs, retractions, latest and as-of bases, 17 algebra queries asserted
+  handled + 14 fallback queries asserted declined, all compared off/adjacency/algebra) and
+  `dense_and_sparse_kernels_agree`.
+- New bench queries on this branch only: `three_hop_count_distinct`, `two_hop_from_42`,
+  `triangle_count`. The existing 10 are unchanged.
+- Log line: `TRIPLOX_MATRIX_ALGEBRA_LOG=1` prints the shape, hop count, whether the
+  bitset kernels were used, and the answer.
+
+## Next
+- Full `cargo test` in all three configurations, clippy, fmt.
+- `stats_run.sh triplox-exp-sparse-matrix sparse-algebra 4 5 off= adj=... algebra=...`
+- Write `EXPERIMENT-ALGEBRA.md`.
