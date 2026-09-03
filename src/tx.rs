@@ -631,15 +631,30 @@ where
         &encode_i64_bytes(crate::schema::DB_TX_ID),
         &value_buf,
     ]);
-    let ave_keys = if layout.is_columnar() {
-        crate::segment::row_keys_with_prefix(sdb, &ave_prefix).await?
-    } else {
-        let mut iter = KeyCursor::scan_prefix(sdb, &ave_prefix).await?;
-        let mut keys = Vec::new();
-        while let Some(key) = iter.next().await? {
-            keys.push(key);
+    // AVE holds one datom per key, columnar segments or row-major segments depending
+    // on the layout, and each shape needs its own reader.
+    let ave_keys = match layout {
+        SegmentLayout::Columnar { .. } => {
+            crate::segment::row_keys_with_prefix(sdb, &ave_prefix).await?
         }
-        keys
+        SegmentLayout::RowSegments { .. } => {
+            let mut iter = KeyCursor::scan_prefix(sdb, &ave_prefix).await?;
+            let mut keys = Vec::new();
+            while let Some(key) = iter.next().await? {
+                keys.push(key);
+            }
+            keys
+        }
+        SegmentLayout::Row => {
+            let mut iter = sdb
+                .scan_prefix_with_options(&ave_prefix, .., &DEFAULT_SCAN_OPTIONS)
+                .await?;
+            let mut keys = Vec::new();
+            while let Some(kv) = iter.next().await? {
+                keys.push(kv.key);
+            }
+            keys
+        }
     };
     let mut tx_eid: Option<i64> = None;
     for key in ave_keys {

@@ -19,6 +19,7 @@ use crate::metadata::Metadata;
 use crate::ops::DataType;
 use crate::ops::{Datom, DatomOp, Entid, TxOp};
 use crate::partition::{extract_counter, partition_entity_prefix, tx_eid_from_tx_id, TX_PARTITION};
+use crate::row_segment::KeyCursor;
 use crate::schema::{Schema, DB_TX_ABORTED, DB_TX_COMMITTED};
 use crate::segment::{merge_into_segments, SegmentLayout};
 use crate::slate::{DEFAULT_SCAN_OPTIONS, DEFAULT_WRITE_OPTIONS};
@@ -923,11 +924,9 @@ mod tests {
     /// Find the first user-partition entity ID by scanning the EAV index.
     async fn find_first_user_entity(slate: &Db) -> Result<i64, Error> {
         let user_base = crate::partition::USER_PARTITION as i64 * (1i64 << 42);
-        let mut iter = slate
-            .scan_prefix_with_options(&[codec::EAV], .., &ScanOptions::default())
-            .await?;
-        while let Some(kv) = iter.next().await? {
-            let (eid, _, _, _, _) = eav_key_to_parts(kv.key.clone())?;
+        let mut iter = KeyCursor::scan_prefix(slate, &[codec::EAV]).await?;
+        while let Some(key) = iter.next().await? {
+            let (eid, _, _, _, _) = eav_key_to_parts(key.clone())?;
             if let DataType::Long(id) = eid {
                 if id >= user_base {
                     return Ok(id);
@@ -943,13 +942,11 @@ mod tests {
         entity_id: i64,
         attr_id: Entid,
     ) -> Result<(u32, u32), Error> {
-        let mut iter = slate
-            .scan_prefix_with_options(&[codec::EAV], .., &ScanOptions::default())
-            .await?;
+        let mut iter = KeyCursor::scan_prefix(slate, &[codec::EAV]).await?;
         let mut add_count = 0;
         let mut retract_count = 0;
-        while let Some(kv) = iter.next().await? {
-            let (eid, attribute, _value, _ts, op) = eav_key_to_parts(kv.key)?;
+        while let Some(key) = iter.next().await? {
+            let (eid, attribute, _value, _ts, op) = eav_key_to_parts(key)?;
             if eid != DataType::Long(entity_id) || attribute != attr_id {
                 continue;
             }
@@ -988,14 +985,12 @@ mod tests {
         let user_base = crate::partition::USER_PARTITION as i64 * (1i64 << 42);
 
         // Find the EAV entry for the user entity (skip bootstrap/schema entries)
-        let mut iter = slate
-            .scan_prefix_with_options(&[codec::EAV], .., &ScanOptions::default())
+        let mut iter = KeyCursor::scan_prefix(slate.as_ref(), &[codec::EAV])
             .await
             .unwrap();
         let mut found = false;
-        while let Some(kv) = iter.next().await? {
-            let (entity_id, attribute, value, _timestamp, suffix) =
-                eav_key_to_parts(kv.key).unwrap();
+        while let Some(key) = iter.next().await? {
+            let (entity_id, attribute, value, _timestamp, suffix) = eav_key_to_parts(key).unwrap();
             if let DataType::Long(eid) = &entity_id {
                 if *eid >= user_base {
                     assert_eq!(attribute, name_id);
@@ -1053,13 +1048,12 @@ mod tests {
 
         // Count EAV entries in USER_PARTITION (should be 2: name + age)
         let user_base = crate::partition::USER_PARTITION as i64 * (1i64 << 42);
-        let mut iter = slate
-            .scan_prefix_with_options(&[codec::EAV], .., &ScanOptions::default())
+        let mut iter = KeyCursor::scan_prefix(slate.as_ref(), &[codec::EAV])
             .await
             .unwrap();
         let mut eav_count = 0;
-        while let Some(kv) = iter.next().await? {
-            let (entity_id, _, _, _, _) = eav_key_to_parts(kv.key).unwrap();
+        while let Some(key) = iter.next().await? {
+            let (entity_id, _, _, _, _) = eav_key_to_parts(key).unwrap();
             if let DataType::Long(eid) = entity_id {
                 if eid >= user_base {
                     eav_count += 1;
@@ -1315,7 +1309,7 @@ mod tests {
             .await?;
 
         let completion =
-            tx::lookup_tx_completion(components.db.as_ref(), tx_key, SegmentLayout::Row)
+            tx::lookup_tx_completion(components.db.as_ref(), tx_key, SegmentLayout::from_env())
                 .await?
                 .expect("tx entity should exist");
         assert_eq!(completion.tx_key, basis);
@@ -1344,7 +1338,7 @@ mod tests {
             .await?;
 
         let completion =
-            tx::lookup_tx_completion(components.db.as_ref(), tx_key, SegmentLayout::Row)
+            tx::lookup_tx_completion(components.db.as_ref(), tx_key, SegmentLayout::from_env())
                 .await?
                 .expect("aborted tx entity should exist");
         assert_eq!(completion.tx_key, basis);
@@ -1362,11 +1356,13 @@ mod tests {
             tx_id: 42,
             system_time: st_from_unix_epoch(2),
         };
-        assert!(
-            tx::lookup_tx_completion(components.db.as_ref(), tx_key, SegmentLayout::Row)
-                .await?
-                .is_none()
-        );
+        assert!(tx::lookup_tx_completion(
+            components.db.as_ref(),
+            tx_key,
+            SegmentLayout::from_env()
+        )
+        .await?
+        .is_none());
 
         Ok(())
     }
@@ -1573,14 +1569,12 @@ mod tests {
             .await?;
 
         // Scan EAV for entity — expect: alice ADD, alice RETRACT, bob ADD
-        let mut iter = slate
-            .scan_prefix_with_options(&[codec::EAV], .., &ScanOptions::default())
-            .await?;
+        let mut iter = KeyCursor::scan_prefix(slate.as_ref(), &[codec::EAV]).await?;
         let mut alice_add = false;
         let mut alice_retract = false;
         let mut bob_add = false;
-        while let Some(kv) = iter.next().await? {
-            let (eid, attribute, value, _ts, op) = eav_key_to_parts(kv.key)?;
+        while let Some(key) = iter.next().await? {
+            let (eid, attribute, value, _ts, op) = eav_key_to_parts(key)?;
             if eid != DataType::Long(entity_id) || attribute != name_id {
                 continue;
             }
@@ -1599,8 +1593,12 @@ mod tests {
         let attr_bytes = encode_i64_bytes(name_id);
         let entity_bytes = DataType::Long(entity_id).encode();
         let ae_key = concat_bytes(&[&[codec::AE], &attr_bytes, &entity_bytes]);
-        let ae_val = slate.get(&ae_key).await?.expect("AE entry should exist");
-        assert!(ae_val.is_empty(), "AE should store empty bytes");
+        let mut ae = KeyCursor::scan_prefix(slate.as_ref(), &ae_key).await?;
+        assert_eq!(
+            ae.next().await?.as_deref(),
+            Some(ae_key.as_slice()),
+            "AE entry should exist"
+        );
 
         Ok(())
     }
@@ -1830,11 +1828,9 @@ mod tests {
             .unwrap();
         assert_eq!(attr.value_type, crate::schema::ValueType::String);
 
-        let mut iter = slate
-            .scan_prefix_with_options(&[codec::EAV], .., &ScanOptions::default())
-            .await?;
-        while let Some(kv) = iter.next().await? {
-            let (entity, attribute, value, _tx, op) = eav_key_to_parts(kv.key)?;
+        let mut iter = KeyCursor::scan_prefix(slate.as_ref(), &[codec::EAV]).await?;
+        while let Some(key) = iter.next().await? {
+            let (entity, attribute, value, _tx, op) = eav_key_to_parts(key)?;
             assert_ne!(
                 (entity, attribute, value, op),
                 (
@@ -1930,11 +1926,9 @@ mod tests {
             .await?;
 
         let mut seen = std::collections::HashSet::new();
-        let mut iter = slate
-            .scan_prefix_with_options(&[codec::EAV], .., &ScanOptions::default())
-            .await?;
-        while let Some(kv) = iter.next().await? {
-            let (eid, attribute, value, _ts, op) = eav_key_to_parts(kv.key)?;
+        let mut iter = KeyCursor::scan_prefix(slate.as_ref(), &[codec::EAV]).await?;
+        while let Some(key) = iter.next().await? {
+            let (eid, attribute, value, _ts, op) = eav_key_to_parts(key)?;
             if attribute != name_id {
                 continue;
             }
@@ -2038,11 +2032,9 @@ mod tests {
             .unwrap()
             .0;
         let mut seen = std::collections::HashSet::new();
-        let mut iter = slate
-            .scan_prefix_with_options(&[codec::EAV], .., &ScanOptions::default())
-            .await?;
-        while let Some(kv) = iter.next().await? {
-            let (eid, attribute, value, _ts, op) = eav_key_to_parts(kv.key)?;
+        let mut iter = KeyCursor::scan_prefix(slate.as_ref(), &[codec::EAV]).await?;
+        while let Some(key) = iter.next().await? {
+            let (eid, attribute, value, _ts, op) = eav_key_to_parts(key)?;
             if eid == DataType::Long(entity_id) && attribute == existing_attr_id {
                 seen.insert((value, op));
             }
@@ -2223,11 +2215,9 @@ mod tests {
 
         let mut saw_email = false;
         let mut saw_name = false;
-        let mut iter = slate
-            .scan_prefix_with_options(&[codec::VAE], .., &ScanOptions::default())
-            .await?;
-        while let Some(kv) = iter.next().await? {
-            let (_value, attribute, _entity, _tx, op) = vae_key_to_parts(kv.key)?;
+        let mut iter = KeyCursor::scan_prefix(slate.as_ref(), &[codec::VAE]).await?;
+        while let Some(key) = iter.next().await? {
+            let (_value, attribute, _entity, _tx, op) = vae_key_to_parts(key)?;
             if op == codec::ADD && attribute == email_id {
                 saw_email = true;
             }
@@ -2387,12 +2377,10 @@ mod tests {
         entity_id: i64,
         attribute_id: i64,
     ) -> Result<Vec<(DataType, i64, u8)>, Error> {
-        let mut iter = slate
-            .scan_prefix_with_options(&[codec::EAV], .., &ScanOptions::default())
-            .await?;
+        let mut iter = KeyCursor::scan_prefix(slate.as_ref(), &[codec::EAV]).await?;
         let mut entries = Vec::new();
-        while let Some(kv) = iter.next().await? {
-            let (eid, attribute, value, tx, op) = eav_key_to_parts(kv.key)?;
+        while let Some(key) = iter.next().await? {
+            let (eid, attribute, value, tx, op) = eav_key_to_parts(key)?;
             if eid == DataType::Long(entity_id) && attribute == attribute_id {
                 entries.push((value, tx, op));
             }

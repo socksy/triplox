@@ -587,7 +587,8 @@ mod tests {
     /// 600 entities, so an AEV run boundary (RUN_SIZE = 256) falls inside the
     /// attribute. `age` maps an entity's insertion index to its `:age` value.
     async fn seeded_node(age: impl Fn(i64) -> i64) -> (Node<MemoryLog>, TxKey) {
-        let node = Node::memory_node().await;
+        // Zone maps summarise raw datom keys, so they only apply to the row layout.
+        let node = Node::memory_node_with_layout(crate::segment::SegmentLayout::Row).await;
         commit(&node, test_schema_tx()).await;
         let mut early = None;
         for chunk in 0..4 {
@@ -682,13 +683,17 @@ mod tests {
         let stats = take_stats();
         set_enabled(previous);
         assert_eq!(rows.len(), 49, "ages 551..599");
-        assert!(
-            stats.seeks_checked > 0,
-            "zone map was never consulted: {stats:?}"
-        );
-        assert!(
-            stats.seeks_skipped > 0,
-            "no per-entity seeks were pruned: {stats:?}"
-        );
+        // Per-entity seek pruning lives in the row engine's candidate enumeration; the
+        // batched engine has no equivalent, so there is nothing to count when it runs.
+        if std::env::var("TRIPLOX_BATCHED_JOIN").is_err() {
+            assert!(
+                stats.seeks_checked > 0,
+                "zone map was never consulted: {stats:?}"
+            );
+            assert!(
+                stats.seeks_skipped > 0,
+                "no per-entity seeks were pruned: {stats:?}"
+            );
+        }
     }
 }

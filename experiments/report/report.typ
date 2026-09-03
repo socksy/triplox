@@ -196,7 +196,9 @@
 #let bar-bad = rgb("#c8705a")
 #let bar-none = rgb("#c3c8c1")
 #let tick-cands = (0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10)
-#let arm-name(a) = (batched: "vectorized join", segments: "datoms per key", columnar: "columnar segments", adj: "adjacency matrices", algebra: "matrix algebra", zone: "zone maps", all: "all on", on: "on").at(a)
+#let arm-names = (batched: "vectorized join", segments: "datoms per key", columnar: "columnar segments", adj: "adjacency matrices", algebra: "matrix algebra", zone: "zone maps", all: "all on", on: "on")
+#let arm-overrides = ("combo-full-algebra": (all: "join + columnar + matrices", algebra: "the same + algebra"), "sparse-algebra": (adj: "matrices only", algebra: "matrices + algebra"))
+#let arm-name(a, key: none) = if key != none and key in arm-overrides and a in arm-overrides.at(key) { arm-overrides.at(key).at(a) } else { arm-names.at(a) }
 // rows: array of (query, (arm: (ratio, lo, hi, significant, off-ms, on-ms)))
 #let ratio-chart(rows, arms) = {
   let vals = ()
@@ -263,7 +265,7 @@
 // ---------- dumbbell chart on an absolute log time axis, with raw samples ----------
 #let ms-label(t) = if t < 1 { str(t) + " ms" } else if t >= 1000 { str(calc.round(t / 1000)) + " s" } else { str(t) + " ms" }
 // rows: array of (query, ratio-text-or-none, ratio-colour, (arm: (median, samples)))
-#let time-chart(rows, arms) = {
+#let time-chart(rows, arms, key: none) = {
   let vals = ()
   for (n, rt, rc, d) in rows { for (a, v) in d { vals.push(v.at(0)); for x in v.at(1) { vals.push(x) } } }
   let vmin = calc.max(0.005, calc.min(..vals)); let vmax = calc.max(..vals)
@@ -289,8 +291,8 @@
     for (i, a) in arms.enumerate() {
       let col = if i == 0 { ink2 } else { arm-color.at(a) }
       draw.circle((lxp + 0.1, top + 0.4), radius: 0.07, fill: col, stroke: none)
-      draw.content((lxp + 0.26, top + 0.4), anchor: "west", stext(if i == 0 { "off" } else { arm-name(a) }, size: 6.8pt, fill: ink))
-      lxp = lxp + 0.55 + 0.12 * (if i == 0 { 3 } else { arm-name(a).len() })
+      draw.content((lxp + 0.26, top + 0.4), anchor: "west", stext(if i == 0 { "off" } else { arm-name(a, key: key) }, size: 6.8pt, fill: ink))
+      lxp = lxp + 0.55 + 0.12 * (if i == 0 { 3 } else { arm-name(a, key: key).len() })
     }
     if k == 2 { draw.content((x1 + 0.15, top + 0.4), anchor: "east", stext([small dots: the 20 samples · large: median], size: 6.4pt, fill: muted)) }
     for (ri, (name, rt, rc, d)) in rows.enumerate() {
@@ -331,7 +333,7 @@
       }
       rows.push((q, rt, rc, d))
     }
-    figure(block(width: 100%, inset: (y: 2pt), align(center, time-chart(rows, arms))), caption: if others.len() == 1 { time-chart-caption } else { [Small dots are the 20 samples of each arm, large markers the medians. Right: times faster than off per arm, grey when the 95% interval includes 1.] })
+    figure(block(width: 100%, inset: (y: 2pt), align(center, time-chart(rows, arms, key: key))), caption: if others.len() == 1 { time-chart-caption } else { [Small dots are the 20 samples of each arm, large markers the medians. Right: times faster than off per arm, grey when the 95% interval includes 1.] })
   } else if key in data {
     let d = data.at(key)
     let rows = order.filter(q => q in d).map(q => { let r = d.at(q).on / d.at(q).off; (q, ratio-words(r, r < 0.85 or r > 1.15), if r < 0.85 { accent } else if r > 1.15 { rust } else { muted }, (off: (d.at(q).off, ()), on: (d.at(q).on, ()))) })
@@ -1160,7 +1162,7 @@ The batched engine sorts each level's bindings by key before it extends them, or
 
 == The full stack #toggle[exp/combo-full]
 
-This stack combines the vectorized join, columnar segments and adjacency matrices, and a sixth arm adds the matrix algebra of section 5.5 on top. The question is whether the matrices still pay once scans are cheap and the join is batched. The chart has six arms: everything off, each of the three toggles alone, all three on, and all three plus the algebra.
+This stack combines the vectorized join, columnar segments and adjacency matrices, and a sixth arm adds the matrix algebra of section 5.5 on top. The question is whether the matrices still pay once scans are cheap and the join is batched. The chart has six arms: everything off, each of the three toggles alone, the three together, and the three together plus the algebra toggle. The algebra is opt-in, so the "join + columnar + matrices" arm runs every query through the join, and the last arm differs from it only on the queries the algebra recognises.
 
 
 

@@ -1372,13 +1372,14 @@ mod tests {
         let mut prefix = vec![codec::AEV];
         prefix.extend_from_slice(&codec::encode_i64_bytes(NAME));
         prefix.extend_from_slice(&entity_1);
+        // Key counts are per SlateDB key; a segmented layout scales them to datoms.
         let expected = usize::try_from(
             runtime.block_on(
                 components
                     .range_stats
                     .estimate_key_count_with_prefix(&prefix),
             )?,
-        )?;
+        )? * crate::segment::SegmentLayout::from_env().segment_size();
 
         let (entity, value) = variables("?e", "?v");
         let pattern = TriplePattern::new(
