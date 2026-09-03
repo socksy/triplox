@@ -53,9 +53,10 @@ async fn commit(node: &Node<MemoryLog>, ops: Vec<TxOp>) -> TxKey {
     }
 }
 
-/// Seeded graph: 30 vertices, deterministic edges, one retraction.
-/// Returns the tx key taken before the retraction so callers can query as-of it.
-async fn build_graph(node: &Node<MemoryLog>) -> TxKey {
+/// Seeded graph of `n` vertices with `fanout` deterministic out-edges each, then
+/// one retraction. Returns the tx key taken before the retraction so callers can
+/// query as-of it.
+async fn build_graph(node: &Node<MemoryLog>, n: i64, fanout: i64) -> TxKey {
     commit(
         node,
         vec![
@@ -67,7 +68,6 @@ async fn build_graph(node: &Node<MemoryLog>) -> TxKey {
     )
     .await;
 
-    let n: i64 = 30;
     let vertices: Vec<TxOp> = (0..n)
         .map(|i| {
             TxOp::put([
@@ -77,7 +77,9 @@ async fn build_graph(node: &Node<MemoryLog>) -> TxKey {
             ])
         })
         .collect();
-    commit(node, vertices).await;
+    for chunk in vertices.chunks(1000) {
+        commit(node, chunk.to_vec()).await;
+    }
 
     let db = node.db().await.expect("db");
     let mut eid = vec![0i64; n as usize];
@@ -94,7 +96,7 @@ async fn build_graph(node: &Node<MemoryLog>) -> TxKey {
 
     let mut edges = Vec::new();
     for i in 0..n {
-        for k in 1..4 {
+        for k in 1..=fanout {
             let j = (i * 7 + k * 3) % n;
             if i != j {
                 edges.push((i, j));
@@ -109,7 +111,11 @@ async fn build_graph(node: &Node<MemoryLog>) -> TxKey {
             value: DataType::Long(eid[*to as usize]),
         })
         .collect();
-    let before_retract = commit(node, edge_ops).await;
+    let mut before_retract = None;
+    for chunk in edge_ops.chunks(1000) {
+        before_retract = Some(commit(node, chunk.to_vec()).await);
+    }
+    let before_retract = before_retract.expect("at least one edge batch");
 
     let (from, to) = edges[0];
     commit(
@@ -202,13 +208,13 @@ fn print_report(label: &str, report: &[(u8, u64, u64, u64, u64)]) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn row_and_columnar_layouts_agree() {
     let row = Node::memory_node_with_layout(SegmentLayout::Row).await;
-    let row_as_of = build_graph(&row).await;
+    let row_as_of = build_graph(&row, 30, 3).await;
     let row_now = results(&row, None).await;
     let row_then = results(&row, Some(row_as_of)).await;
     let row_storage = storage_report(&row).await;
 
     let col = Node::memory_node_with_layout(SegmentLayout::Columnar { segment_size: 64 }).await;
-    let col_as_of = build_graph(&col).await;
+    let col_as_of = build_graph(&col, 30, 3).await;
     let col_now = results(&col, None).await;
     let col_then = results(&col, Some(col_as_of)).await;
     let col_storage = storage_report(&col).await;
@@ -241,5 +247,37 @@ async fn row_and_columnar_layouts_agree() {
     assert_eq!(row_datoms, col_datoms, "AEV datom count must match");
 
     row.close().await.unwrap();
+    col.close().await.unwrap();
+}
+
+/// Storage-only report at benchmark scale. Ignored by default because it ingests
+/// tens of thousands of datoms in a debug build.
+///
+/// `VERTICES`, `FANOUT` and `TRIPLOX_SEGMENT_SIZE` tune the graph.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn storage_report_at_scale() {
+    let n: i64 = std::env::var("VERTICES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2000);
+    let fanout: i64 = std::env::var("FANOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let segment_size: usize = std::env::var("TRIPLOX_SEGMENT_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024);
+    println!("vertices={n} fanout={fanout} segment_size={segment_size}");
+
+    let row = Node::memory_node_with_layout(SegmentLayout::Row).await;
+    build_graph(&row, n, fanout).await;
+    print_report("row", &storage_report(&row).await);
+    row.close().await.unwrap();
+
+    let col = Node::memory_node_with_layout(SegmentLayout::Columnar { segment_size }).await;
+    build_graph(&col, n, fanout).await;
+    print_report("columnar", &storage_report(&col).await);
     col.close().await.unwrap();
 }
