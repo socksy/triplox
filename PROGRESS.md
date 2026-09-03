@@ -54,8 +54,21 @@ segments, adjacency matrices, matrix algebra) plus the `experiments/` directory;
 - experiments/README.md rewritten: PDF link at the top, all six toggles, and what the report
   did and did not measure on this tree. `experiments/report/` refreshed.
 
+- Row-count equivalence: `RUNS=1 VERTICES=2000 EDGE_PROB=0.01 ASOF=1` in all seven
+  configurations (off, batched, adj+algebra, zone, row-segments 256, columnar 1024, all on).
+  All 16 queries return the same row count in every arm, and the counts match the
+  pre-experiment baseline: triangles 7821, out_degree 2000, in_degree_top 2000,
+  neighbors_of_42 21, weight_filter 198, heavy_neighbors 1908, asof_mid_out_degree 996,
+  asof_out_degree 0, the rest 1.
+- The two newly integrated features are demonstrably live, not silently off. Row-segments at
+  size 256 turns 45953 EAV keys into 224, 45953 AVE into 1122 and 45953 AEV into 240, the same
+  numbers as the source branch. Zone maps prune 1230 of 2000 per-entity seeks on
+  `weight_filter` and `heavy_neighbors`, and skip 155/155/77 runs on the three as-of queries,
+  again matching the source branch.
+
 ## Next
-- Row-count equivalence across arms, then the final commit and push to `fork`.
+Nothing outstanding. Re-timing row-segments and zone maps on this tree is the obvious
+follow-up; the report's numbers for chapters 3 and 6 come from their own branches.
 
 ---
 
