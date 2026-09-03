@@ -66,6 +66,11 @@ the absolute numbers are noisy — the interleaving is what keeps the comparison
 | `label_lookup` | 1 | 0.05 | 0.03 | **1.57x** | 0.01 | 0.02 | 0.94x |
 Row counts are identical off, on, and against the pre-experiment baseline for all ten queries.
 
+A larger run (5000 vertices, 100262 edges) was started and abandoned: `three_hop_count` at
+that size builds tens of millions of binding rows and had reached 3.7 GB resident with no
+end in sight, on a machine already saturated by other benchmark agents. That is a property
+of the benchmark query, not of the matrices.
+
 The matrix itself: `nnz=39764`, 2000 rows in each orientation, **1451992 bytes** (1.45 MB,
 about 36 bytes per edge across both directions), built in **38-40 ms**, once per
 (attribute, tx_id).

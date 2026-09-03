@@ -24,7 +24,7 @@ RedisGraph/GraphBLAS-style: per (ref attribute, basis) build CSR adjacency from 
 
 ## Next
 - Done. EXPERIMENT.md written, final interleaved A/B in results/sparse-matrix-{off,on}.json.
-- Optional if anyone picks this up again: VERTICES=5000 EDGE_PROB=0.004 scaling run (skipped, machine was saturated by other benchmark agents).
+- VERTICES=5000 EDGE_PROB=0.004 scaling run attempted and abandoned: three_hop_count reached 3.7 GB RSS with no end in sight (tens of millions of binding rows). Noted in EXPERIMENT.md. If anyone retries it, they need a bench harness that can skip three_hop_count.
 
 ## Shared context
 
