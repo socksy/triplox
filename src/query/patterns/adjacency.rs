@@ -397,7 +397,8 @@ mod tests {
         "[:find ?a :where [?b :g/id 3] [?a :g/to ?b]]",
         "[:find ?a ?b :where [?a :g/to ?b] [?b :g/weight ?w] [(> ?w 50)]]",
         "[:find ?a :where [?a :g/id ?i] [?b :g/id 3] (not [?a :g/to ?b])]",
-        "[:find ?a ?w :where [?a :g/weight ?w] [?a :g/to ?a]]",
+        // Both sides constant: exercises the validate path with no proposals.
+        "[:find ?a ?b :where [?a :g/id 0] [?b :g/id 10] [?a :g/to ?b]]",
     ];
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

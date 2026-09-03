@@ -3,17 +3,17 @@
 ## Goal
 RedisGraph/GraphBLAS-style: per (ref attribute, basis) build CSR adjacency from one AEV scan, cache on the node, and serve `[?x :ref ?y]` triple patterns from it (row lookups for hops, intersections for triangle closing edge, row nnz for degree) instead of SlateDB iterators. Toggle: env var (check src/query/adjacency.rs for the name actually used). Time-travel queries may fall back.
 
-## Status (as of hand-off)
-- Compiles (cargo check --all-targets clean).
-- New: src/query/adjacency.rs (AdjMatrix, Csr both orientations, cache keyed by basis, build timing), src/query/patterns/adjacency.rs (AdjacencyPattern implementing ExecPattern, same contract as TriplePattern).
-- Modified: db_value.rs, node.rs, query.rs, query/engine.rs, query/exec_pattern.rs, query/patterns/mod.rs, query/plan.rs (planner substitutes AdjacencyPattern for ref-attribute triple patterns when enabled).
-- Previous agent's last note: "the first queries now match; only my not-clause test query is invalid Datalog here. Fixing that query and rerunning." So an on/off equivalence test exists or is half-written and one of its queries uses a not clause that does not parse.
+## Status
+- Compiles clean.
+- New: src/query/adjacency.rs (AdjMatrix, Csr both orientations, cache keyed by (attr, tx_id), build timing), src/query/patterns/adjacency.rs (AdjacencyPattern implementing ExecPattern, same contract as TriplePattern).
+- Modified: db_value.rs, node.rs, query.rs, query/engine.rs (candidate-set intersection stage), query/exec_pattern.rs, query/patterns/mod.rs, query/plan.rs (planner substitutes AdjacencyPattern for ref-attribute triple patterns when enabled).
+- Toggle: env var `TRIPLOX_ADJ_MATRIX=1` (src/node.rs `adjacency_matrix_enabled`). `TRIPLOX_ADJ_MATRIX_LOG` prints per-matrix nnz/bytes/build_ms.
+- Equivalence test `query::patterns::adjacency::tests::adjacency_path_matches_iterator_path` PASSES (11 queries, on vs off, 40-vertex graph incl. a retraction). The previously broken query was not the not-clause one but a repeated-variable self-loop pattern (`[?a :g/to ?a]`), which the engine does not support at all; it was replaced by a both-sides-constant validate-path query.
 
 ## Next
-1. Find the equivalence test, fix or drop the invalid not-clause query, run it.
-2. cargo test -p triplox, clippy.
-3. A/B bench (3 off / 3 on, alternating), also VERTICES=5000 EDGE_PROB=0.004 once if time allows. Record matrix build time and memory.
-4. EXPERIMENT.md, fmt, commit.
+1. cargo test -p triplox (full), clippy.
+2. A/B bench (3 off / 3 on, alternating), plus VERTICES=5000 EDGE_PROB=0.004 once if time allows. Record matrix build time and memory.
+3. EXPERIMENT.md, fmt, commit.
 
 ## Shared context
 
