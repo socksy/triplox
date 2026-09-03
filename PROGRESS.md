@@ -13,8 +13,14 @@ RedisGraph/GraphBLAS-style: per (ref attribute, basis) build CSR adjacency from 
 - `cargo test -p triplox` PASSES: 610 lib + 32 integration, 0 failed (both with the toggle off and with `TRIPLOX_ADJ_MATRIX=1`, i.e. the whole suite is a second equivalence check).
 - `cargo clippy -p triplox --all-targets` PASSES with zero warnings.
 
+- A/B bench DONE: interleaved off/on/off/on/off/on, RUNS=5 each, VERTICES=2000 EDGE_PROB=0.01. Aggregated to results/sparse-matrix-off.json and results/sparse-matrix-on.json in the scratchpad results dir. Row counts identical off/on/baseline for all 10 queries.
+- Medians (median of 3 run-medians, ms): triangles 575->20 (28.5x), two_hop_count 238->133 (1.8x), three_hop_count 7034->5589 (1.3x, very noisy), out_degree 47->6.7 (7.1x), in_degree_top 47->6.5 (7.2x), neighbors_of_42 1.40->0.03 (52x), weight_filter/weight_sum/label_lookup unchanged (no ref attr), heavy_neighbors 69->668 (9.6x SLOWER - regression to explain).
+- Matrix: attr :g/to, nnz=39764, rows_out=2000, rows_in=2000, bytes=1451992 (1.45 MB, ~36 B/edge across both orientations), build_ms ~38-40 once per (attr, tx).
+- NOTE: this machine's disk hit 100% mid-experiment (concurrent agents). Keep bench outputs tiny; do not start large new builds without checking `df -k /`.
+
 ## Next
-1. A/B bench (3 off / 3 on, alternating), plus VERTICES=5000 EDGE_PROB=0.004 once if time allows. Record matrix build time and memory.
+1. Explain the heavy_neighbors 9.6x regression (suspect plan flip: AdjacencyPattern.count() reports rows_out=2000 for a fully unbound ref pattern, so the planner may no longer start from the selective :g/weight pattern). Confirm, note honestly in EXPERIMENT.md; fix only if cheap.
+2. Optional VERTICES=5000 EDGE_PROB=0.004 run if disk allows.
 3. EXPERIMENT.md, fmt, commit.
 
 ## Shared context
