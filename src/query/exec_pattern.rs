@@ -57,6 +57,16 @@ pub(crate) trait ExecPattern: Send + Sync {
         bail!("Pattern {} cannot propose", self.id())
     }
 
+    // Sorted entity-id candidates per input row for `added`, when available without IO.
+    // Lets the engine intersect several proposers instead of proposing then validating.
+    fn candidate_sets<'a>(
+        &'a self,
+        _input: &BindingBag,
+        _added: &[Variable],
+    ) -> Result<Option<Vec<&'a [i64]>>> {
+        Ok(None)
+    }
+
     // Extends the `input`` when `added` is non-empty; otherwise filters `input` without changing its layout.
     /// An empty `added` existentially validates the current `input` binding prefix; unbound pattern variables remain for later stages.
     fn join(

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{ensure, Context, Result};
 
+use super::adjacency::{encode_entity, intersect_sorted};
 use super::binding_bag::BindingBag;
 use super::exec_pattern::{ExecPattern, PatternId, Proposal};
 use super::stage::Stage;
@@ -48,7 +49,42 @@ impl GenericJoinEngine {
         Ok(())
     }
 
+    // Intersects the candidate sets of every proposer when all of them can supply one.
+    fn execute_intersecting_stage(stage: &Stage, input: &BindingBag) -> Result<Option<BindingBag>> {
+        let mut per_proposer = Vec::with_capacity(stage.proposers().len());
+        for proposer in stage.proposers() {
+            match proposer.candidate_sets(input, stage.added())? {
+                Some(sets) => per_proposer.push(sets),
+                None => return Ok(None),
+            }
+        }
+        let extensions = (0..input.rows.len())
+            .map(|row_index| {
+                let sets: Vec<&[i64]> = per_proposer.iter().map(|sets| sets[row_index]).collect();
+                intersect_sorted(&sets)
+                    .into_iter()
+                    .map(|id| vec![encode_entity(id)])
+                    .collect()
+            })
+            .collect();
+        let proposed = input
+            .extend_rows(stage.added().to_vec(), extensions)?
+            .reorder(stage.target_variables())?;
+        let proposer_ids: Vec<PatternId> = stage.proposers().map(|p| p.id()).collect();
+        let validators = stage
+            .participants()
+            .iter()
+            .filter(|participant| !proposer_ids.contains(&participant.id()))
+            .map(|participant| participant.as_ref());
+        Self::validate_all(proposed, validators).map(Some)
+    }
+
     fn execute_proposing_stage(stage: &Stage, input: &BindingBag) -> Result<BindingBag> {
+        if stage.proposers().len() > 1 && stage.added().len() == 1 {
+            if let Some(result) = Self::execute_intersecting_stage(stage, input)? {
+                return Ok(result);
+            }
+        }
         if stage.proposers().len() == 1 {
             let proposer = stage
                 .proposers()

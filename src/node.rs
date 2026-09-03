@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,7 +22,8 @@ use crate::kafka_log::KafkaLog;
 use crate::log::{subscribe, TxLog, TxLogReader, TxLogWriter};
 use crate::memory_log::MemoryLog;
 use crate::ops::{QueryArg, TxOp};
-use crate::schema::Schema;
+use crate::query::adjacency::AdjacencyCache;
+use crate::schema::{IdentMap, Schema, ValueType};
 use crate::slate::{in_memory_slate, local_slate, remote_slate, SlateComponents};
 use edn::query::ParsedQuery;
 use tokio_util::sync::CancellationToken;
@@ -40,6 +42,12 @@ pub struct Node<L: TxLog> {
     pub(crate) slate: SlateComponents,
     subscription: CancellationToken,
     incremental: IncrementalQueryService,
+    adjacency_cache: Arc<AdjacencyCache>,
+}
+
+/// TRIPLOX_ADJ_MATRIX=1 serves ref-attribute patterns from adjacency matrices.
+pub(crate) fn adjacency_matrix_enabled() -> bool {
+    std::env::var("TRIPLOX_ADJ_MATRIX").is_ok_and(|v| v == "1" || v == "true")
 }
 
 pub(crate) trait SchemaProvider: Send + Sync + 'static {
@@ -107,6 +115,7 @@ impl<L: TxLog> Node<L> {
             slate,
             subscription,
             incremental,
+            adjacency_cache: Arc::default(),
         })
     }
 }
@@ -144,6 +153,7 @@ impl Node<MemoryLog> {
             slate,
             subscription,
             incremental,
+            adjacency_cache: Arc::default(),
         }
     }
 }
@@ -245,23 +255,46 @@ impl<L: TxLog> Node<L> {
                 timeout,
             })??;
 
-        let ident_map = self
-            .indexer
-            .read()
-            .await
-            .metadata()
-            .schema
-            .ident_map
-            .clone();
+        let (ident_map, ref_attributes) = self.schema_maps().await;
         let handle = Handle::current();
         let range_stats = self.slate.range_stats.clone();
-        Ok(DB::new(
+        let db = DB::new(
             self.slate.db.clone(),
             ident_map,
             handle,
             tx_key,
             range_stats,
-        ))
+        );
+        Ok(self.attach_adjacency(db, ref_attributes, adjacency_matrix_enabled()))
+    }
+
+    async fn schema_maps(&self) -> (IdentMap, HashSet<i64>) {
+        let indexer = self.indexer.read().await;
+        let schema = &indexer.metadata().schema;
+        let ref_attributes = schema
+            .attribute_map
+            .iter()
+            .filter(|(_, attribute)| attribute.value_type == ValueType::Ref)
+            .map(|(id, _)| *id)
+            .collect();
+        (schema.ident_map.clone(), ref_attributes)
+    }
+
+    fn attach_adjacency(&self, db: DB, ref_attributes: HashSet<i64>, enabled: bool) -> DB {
+        if enabled {
+            db.with_adjacency(Arc::clone(&self.adjacency_cache), ref_attributes)
+        } else {
+            db
+        }
+    }
+
+    /// Latest DB with adjacency matrices explicitly on or off, regardless of the env toggle.
+    pub(crate) async fn db_with_adjacency(&self, enabled: bool) -> Result<DB, Error> {
+        let (ident_map, ref_attributes) = self.schema_maps().await;
+        let handle = Handle::current();
+        let range_stats = self.slate.range_stats.clone();
+        let db = DB::from_latest_sdb(self.slate.db.clone(), ident_map, handle, range_stats).await?;
+        Ok(self.attach_adjacency(db, ref_attributes, enabled))
     }
 
     pub(crate) async fn register_incremental_query(
@@ -321,17 +354,7 @@ impl<L: TxLog> QueryNode for Node<L> {
     type DB = DB;
 
     async fn db(&self) -> Result<DB, Error> {
-        let ident_map = self
-            .indexer
-            .read()
-            .await
-            .metadata()
-            .schema
-            .ident_map
-            .clone();
-        let handle = Handle::current();
-        let range_stats = self.slate.range_stats.clone();
-        DB::from_latest_sdb(self.slate.db.clone(), ident_map, handle, range_stats).await
+        self.db_with_adjacency(adjacency_matrix_enabled()).await
     }
 
     async fn db_as_of(&self, tx_key: TxKey) -> Result<DB, Error> {

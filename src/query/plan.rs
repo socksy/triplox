@@ -20,6 +20,7 @@ use crate::query::{
 
 use super::binding_bag::BindingBag;
 use super::exec_pattern::{ExecPattern, PatternId};
+use super::patterns::adjacency::AdjacencyPattern;
 use super::patterns::function::FunctionPattern;
 use super::patterns::not::NotPattern;
 use super::patterns::or::OrPattern;
@@ -374,6 +375,16 @@ impl LogicalDescriptor {
             LogicalDescriptorKind::Triple(pattern) => {
                 let attribute = resolve_attribute_from_pattern(&pattern.attribute, db.ident_map())
                     .with_context(|| format!("Failed to resolve triple pattern {}", self.id))?;
+                if let Some(matrix) = db.adjacency(attribute)? {
+                    if let Some(adjacency) = AdjacencyPattern::new(
+                        self.id,
+                        entity_term(&pattern.entity)?,
+                        value_term(&pattern.value)?,
+                        matrix,
+                    )? {
+                        return Ok(Arc::new(adjacency));
+                    }
+                }
                 Ok(Arc::new(TriplePattern::new(
                     self.id,
                     entity_term(&pattern.entity)?,
