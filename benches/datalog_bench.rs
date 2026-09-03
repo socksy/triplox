@@ -193,6 +193,8 @@ async fn main() {
         {
             continue;
         }
+        // Marks the stderr stream so a TRIPLOX_ENGINE_LOG run can be read per query.
+        eprintln!("--query {name}");
         let mut times = Vec::with_capacity(runs);
         let mut rows = 0;
         for _ in 0..runs {
