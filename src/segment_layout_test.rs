@@ -281,3 +281,47 @@ async fn storage_report_at_scale() {
     print_report("columnar", &storage_report(&col).await);
     col.close().await.unwrap();
 }
+
+/// The batched engine reaches storage through the same iterator helpers the row engine uses, so
+/// it must return the same rows over a row-segments database as the row engine does, on both the
+/// current basis and an as-of one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batched_and_row_engines_agree_over_segments() {
+    use std::sync::Arc;
+
+    use crate::query::binding_bag::BindingBag;
+    use crate::query::engine::GenericJoinEngine;
+    use crate::query::plan::build_logical_plan;
+    use crate::query::vectorized::engine::BatchedJoinEngine;
+
+    let node = Node::memory_node_with_layout(SegmentLayout::RowSegments { segment_size: 64 }).await;
+    let before_retract = build_graph(&node, 30, 3).await;
+    let bases = [
+        Arc::new(node.db().await.expect("db")),
+        Arc::new(node.db_as_of(before_retract).await.expect("db_as_of")),
+    ];
+    let mut compared = 0;
+    for q in QUERIES {
+        let parsed = edn::parse::parse_query(q).expect("parse");
+        let logical = build_logical_plan(&parsed, &[]).expect("plan");
+        for db in &bases {
+            let stages = logical.materialize(Arc::clone(db), None).expect("stages");
+            assert!(
+                BatchedJoinEngine::supports(&stages),
+                "{q} should run on the batched engine"
+            );
+            let rows = tokio::task::block_in_place(|| {
+                GenericJoinEngine::execute(&stages, BindingBag::unit())
+            })
+            .expect("row engine");
+            let batched = tokio::task::block_in_place(|| BatchedJoinEngine::execute(&stages))
+                .expect("batched engine");
+            assert_eq!(batched.variables, rows.variables, "layout for {q}");
+            assert_eq!(batched.rows, rows.rows, "rows for {q}");
+            assert!(!rows.rows.is_empty(), "{q} produced no rows to compare");
+            compared += 1;
+        }
+    }
+    assert_eq!(compared, QUERIES.len() * 2);
+    node.close().await.unwrap();
+}
